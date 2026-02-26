@@ -103,6 +103,15 @@ export function safeNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function calcRtfx(audioDurationSec, stageMs) {
+  const duration = Number(audioDurationSec);
+  const latencyMs = Number(stageMs);
+  if (!Number.isFinite(duration) || !Number.isFinite(latencyMs) || duration <= 0 || latencyMs <= 0) {
+    return null;
+  }
+  return (duration * 1000) / latencyMs;
+}
+
 function csvEscape(value) {
   if (value === null || value === undefined) return '';
   const text = String(value);
@@ -120,6 +129,8 @@ export function toCsv(rows, columns) {
 
 export function flattenRunRecord(run) {
   const metrics = run.metrics || {};
+  const encodeRtfx = calcRtfx(run.audioDurationSec, metrics.encode_ms);
+  const decodeRtfx = calcRtfx(run.audioDurationSec, metrics.decode_ms);
 
   return {
     batch_id: run.batchId,
@@ -145,6 +156,8 @@ export function flattenRunRecord(run) {
     tokenize_ms: metrics.tokenize_ms,
     total_ms: metrics.total_ms,
     rtf: metrics.rtf,
+    encode_rtfx: encodeRtfx,
+    decode_rtfx: decodeRtfx,
     preprocessor_backend: metrics.preprocessor_backend,
     error: run.error || '',
     model_key: run.modelKey,
@@ -187,6 +200,8 @@ export const RUN_CSV_COLUMNS = [
   'tokenize_ms',
   'total_ms',
   'rtf',
+  'encode_rtfx',
+  'decode_rtfx',
   'preprocessor_backend',
   'error',
   'model_key',

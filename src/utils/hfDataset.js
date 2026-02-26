@@ -1,5 +1,5 @@
 const HF_DATASET_API = 'https://datasets-server.huggingface.co';
-const MIN_REQUEST_GAP_MS = 500;
+const MIN_REQUEST_GAP_MS = 200;
 
 let lastRequestAt = 0;
 let requestQueue = Promise.resolve();

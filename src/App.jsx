@@ -38,6 +38,101 @@ const BACKENDS = ['webgpu-hybrid', 'webgpu', 'wasm'];
 const QUANTS = ['fp32', 'int8', 'fp16'];
 const PREPROCESSOR_MODEL = 'nemo128';
 const WARMUP_AUDIO_FALLBACK_URL = 'https://raw.githubusercontent.com/ysdede/parakeet.js/master/examples/demo/public/assets/life_Jim.wav';
+const QUANTIZATION_ORDER = ['fp16', 'int8', 'fp32'];
+const MODEL_FILES_CACHE = new Map();
+
+function formatRepoPath(repoId) {
+  return String(repoId || '')
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+}
+
+function normalizeRepoPath(path) {
+  return String(path || '').replace(/^\.\/+/, '').replace(/\\/g, '/');
+}
+
+function parseModelFiles(payload) {
+  if (Array.isArray(payload)) {
+    return payload
+      .filter((entry) => entry?.type === 'file' && typeof entry?.path === 'string')
+      .map((entry) => normalizeRepoPath(entry.path));
+  }
+
+  if (payload && typeof payload === 'object' && Array.isArray(payload.siblings)) {
+    return payload.siblings
+      .map((entry) => normalizeRepoPath(entry?.rfilename))
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+function hasModelFile(files, filename) {
+  const target = normalizeRepoPath(filename);
+  return files.some((path) => path === target || path.endsWith(`/${target}`));
+}
+
+async function fetchModelFiles(repoId, revision = 'main') {
+  if (!repoId) return [];
+  const cacheKey = `${repoId}@${revision}`;
+  if (MODEL_FILES_CACHE.has(cacheKey)) return MODEL_FILES_CACHE.get(cacheKey);
+
+  const repoPath = formatRepoPath(repoId);
+  const encodedRevision = encodeURIComponent(revision);
+  const treeUrl = `https://huggingface.co/api/models/${repoPath}/tree/${encodedRevision}?recursive=1`;
+  const metadataUrl = `https://huggingface.co/api/models/${repoPath}?revision=${encodedRevision}`;
+
+  try {
+    const response = await fetch(treeUrl);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const files = parseModelFiles(await response.json());
+    MODEL_FILES_CACHE.set(cacheKey, files);
+    return files;
+  } catch (treeError) {
+    console.warn(`[modelSelection] Tree listing failed for ${repoId}@${revision}; trying metadata`, treeError);
+  }
+
+  try {
+    const response = await fetch(metadataUrl);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const files = parseModelFiles(await response.json());
+    MODEL_FILES_CACHE.set(cacheKey, files);
+    return files;
+  } catch (metadataError) {
+    console.warn(`[modelSelection] Metadata listing failed for ${repoId}@${revision}`, metadataError);
+    return [];
+  }
+}
+
+function getAvailableQuantModes(files, baseName) {
+  const options = QUANTIZATION_ORDER.filter((quant) => {
+    if (quant === 'fp32') return hasModelFile(files, `${baseName}.onnx`);
+    if (quant === 'fp16') return hasModelFile(files, `${baseName}.fp16.onnx`);
+    return hasModelFile(files, `${baseName}.int8.onnx`);
+  });
+  return options.length ? options : ['fp32'];
+}
+
+function pickPreferredQuant(available, currentBackend, component = 'encoder') {
+  let preferred;
+  if (component === 'decoder') {
+    preferred = ['int8', 'fp32', 'fp16'];
+  } else {
+    preferred = String(currentBackend || '').startsWith('webgpu')
+      ? ['fp16', 'fp32', 'int8']
+      : ['int8', 'fp32', 'fp16'];
+  }
+  return preferred.find((quant) => available.includes(quant)) || available[0] || 'fp32';
+}
+
+function revokeBlobUrls(urls) {
+  for (const value of Object.values(urls || {})) {
+    if (typeof value === 'string' && value.startsWith('blob:')) {
+      URL.revokeObjectURL(value);
+    }
+  }
+}
 
 function clamp(value, fallback, min, max) {
   const num = Number(value);
@@ -51,6 +146,19 @@ function pct(value) {
 
 function ms(value) {
   return Number.isFinite(value) ? `${value.toFixed(1)} ms` : '-';
+}
+
+function rtfx(value) {
+  return Number.isFinite(value) ? `${value.toFixed(2)}x` : '-';
+}
+
+function calcRtfx(audioDurationSec, stageMs) {
+  const duration = Number(audioDurationSec);
+  const latencyMs = Number(stageMs);
+  if (!Number.isFinite(duration) || !Number.isFinite(latencyMs) || duration <= 0 || latencyMs <= 0) {
+    return null;
+  }
+  return (duration * 1000) / latencyMs;
 }
 
 function deltaPercent(base, next, lowerIsBetter = true) {
@@ -269,6 +377,8 @@ function compactRunsForStorage(runs) {
       tokenize_ms: run.metrics.tokenize_ms,
       total_ms: run.metrics.total_ms,
       rtf: run.metrics.rtf,
+      encode_rtfx: calcRtfx(run.audioDurationSec, run.metrics.encode_ms),
+      decode_rtfx: calcRtfx(run.audioDurationSec, run.metrics.decode_ms),
       preprocessor_backend: run.metrics.preprocessor_backend,
     } : null,
     error: run.error || null,
@@ -438,6 +548,7 @@ export default function App() {
 
   const [modelStatus, setModelStatus] = useState('Model not loaded');
   const [modelProgress, setModelProgress] = useState('');
+  const [resolvedModelInfo, setResolvedModelInfo] = useState('');
   const [datasetStatus, setDatasetStatus] = useState('Idle');
   const [benchStatus, setBenchStatus] = useState('No runs yet');
 
@@ -456,10 +567,42 @@ export default function App() {
   const [hardwareProfile, setHardwareProfile] = useState(null);
   const [hardwareStatus, setHardwareStatus] = useState('Not collected');
   const [isLoadingHardware, setIsLoadingHardware] = useState(false);
+  const [encoderQuantOptions, setEncoderQuantOptions] = useState(QUANTS);
+  const [decoderQuantOptions, setDecoderQuantOptions] = useState(QUANTS);
 
   const modelRef = useRef(null);
+  const releaseQueueRef = useRef(Promise.resolve());
   const stopRef = useRef(false);
   const audioCacheRef = useRef(new Map());
+
+  async function releaseModelResources(model) {
+    if (!model) return;
+    try { model.stopProfiling?.(); } catch {}
+    const releasables = [
+      model.encoderSession,
+      model.joinerSession,
+      model.onnxPreprocessor?.session,
+    ];
+    await Promise.all(releasables.map(async (session) => {
+      if (!session) return;
+      try {
+        if (typeof session.release === 'function') {
+          await session.release();
+        } else if (typeof session.dispose === 'function') {
+          session.dispose();
+        }
+      } catch {}
+    }));
+  }
+
+  function queueModelRelease(model) {
+    if (!model) return releaseQueueRef.current;
+    const releaseTask = releaseQueueRef.current
+      .catch(() => {})
+      .then(() => releaseModelResources(model));
+    releaseQueueRef.current = releaseTask.catch(() => {});
+    return releaseTask;
+  }
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
@@ -484,9 +627,50 @@ export default function App() {
 
   useEffect(() => {
     // Changing model/runtime parameters invalidates the previously loaded model.
+    const previousModel = modelRef.current;
     modelRef.current = null;
+    void queueModelRelease(previousModel);
     setIsModelReady(false);
+    setResolvedModelInfo('');
   }, [modelKey, backend, encoderQuant, decoderQuant, preprocessorBackend, cpuThreads]);
+
+  useEffect(() => () => {
+    const model = modelRef.current;
+    modelRef.current = null;
+    void queueModelRelease(model);
+  }, []);
+
+  useEffect(() => {
+    setEncoderQuant((current) => (
+      encoderQuantOptions.includes(current)
+        ? current
+        : pickPreferredQuant(encoderQuantOptions, backend, 'encoder')
+    ));
+    setDecoderQuant((current) => (
+      decoderQuantOptions.includes(current)
+        ? current
+        : pickPreferredQuant(decoderQuantOptions, backend, 'decoder')
+    ));
+  }, [backend, encoderQuantOptions, decoderQuantOptions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const repoId = MODELS[modelKey]?.repoId || modelKey;
+
+    (async () => {
+      const files = await fetchModelFiles(repoId, 'main');
+      if (cancelled) return;
+
+      const encOptions = getAvailableQuantModes(files, 'encoder-model');
+      const decOptions = getAvailableQuantModes(files, 'decoder_joint-model');
+      setEncoderQuantOptions(encOptions);
+      setDecoderQuantOptions(decOptions);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [modelKey]);
 
   useEffect(() => {
     localStorage.setItem(SNAPSHOTS_KEY, JSON.stringify(snapshots));
@@ -696,9 +880,14 @@ export default function App() {
     setModelStatus('Loading model...');
     setIsModelReady(false);
     setModelProgress('');
+    setResolvedModelInfo('');
 
     try {
-      const hub = await getParakeetModel(modelKey, {
+      const previousModel = modelRef.current;
+      modelRef.current = null;
+      await queueModelRelease(previousModel);
+
+      const baseOptions = {
         backend,
         encoderQuant,
         decoderQuant,
@@ -713,18 +902,91 @@ export default function App() {
           }
           setModelProgress(`${file}: ${Math.round((loaded / total) * 100)}%`);
         },
-      });
+      };
 
-      modelRef.current = await ParakeetModel.fromUrls({
-        ...hub.urls,
-        filenames: hub.filenames,
-        preprocessorBackend: hub.preprocessorBackend,
-        backend,
-        encoderQuant,
-        decoderQuant,
-        cpuThreads,
-        verbose: false,
-      });
+      const compileFromHub = async (hubResult, requestedEncoderQuant, requestedDecoderQuant) => (
+        ParakeetModel.fromUrls({
+          ...hubResult.urls,
+          filenames: hubResult.filenames,
+          preprocessorBackend: hubResult.preprocessorBackend,
+          backend,
+          encoderQuant: requestedEncoderQuant,
+          decoderQuant: requestedDecoderQuant,
+          cpuThreads,
+          verbose: false,
+        })
+      );
+
+      let hub;
+      let effectiveEncoderQuant = encoderQuant;
+      let effectiveDecoderQuant = decoderQuant;
+      const loadNotes = [];
+
+      try {
+        hub = await getParakeetModel(modelKey, baseOptions);
+      } catch (firstDownloadError) {
+        const selectedFp16 = encoderQuant === 'fp16' || decoderQuant === 'fp16';
+        if (!selectedFp16) throw firstDownloadError;
+
+        effectiveEncoderQuant = encoderQuant === 'fp16' ? 'fp32' : encoderQuant;
+        effectiveDecoderQuant = decoderQuant === 'fp16' ? 'fp32' : decoderQuant;
+        setModelProgress('FP16 assets unavailable, retrying with fp32...');
+        hub = await getParakeetModel(modelKey, {
+          ...baseOptions,
+          encoderQuant: effectiveEncoderQuant,
+          decoderQuant: effectiveDecoderQuant,
+        });
+        loadNotes.push('fp16 assets unavailable, retried with fp32');
+      }
+
+      try {
+        modelRef.current = await compileFromHub(hub, effectiveEncoderQuant, effectiveDecoderQuant);
+      } catch (firstCompileError) {
+        const canRetry = hub?.quantisation?.encoder === 'fp16' || hub?.quantisation?.decoder === 'fp16';
+        if (!canRetry) throw firstCompileError;
+
+        revokeBlobUrls(hub?.urls);
+        effectiveEncoderQuant = hub?.quantisation?.encoder === 'fp16' ? 'fp32' : effectiveEncoderQuant;
+        effectiveDecoderQuant = hub?.quantisation?.decoder === 'fp16' ? 'fp32' : effectiveDecoderQuant;
+        setModelProgress('FP16 compile failed, retrying with fp32...');
+
+        let retryHub;
+        try {
+          retryHub = await getParakeetModel(modelKey, {
+            ...baseOptions,
+            encoderQuant: effectiveEncoderQuant,
+            decoderQuant: effectiveDecoderQuant,
+          });
+        } catch (retryDownloadError) {
+          throw new Error(
+            `Initial compile failed (${firstCompileError?.message || firstCompileError}). ` +
+            `FP32 retry download failed (${retryDownloadError?.message || retryDownloadError}).`
+          );
+        }
+
+        try {
+          modelRef.current = await compileFromHub(retryHub, effectiveEncoderQuant, effectiveDecoderQuant);
+        } catch (retryCompileError) {
+          throw new Error(
+            `Initial compile failed (${firstCompileError?.message || firstCompileError}). ` +
+            `FP32 retry compile failed (${retryCompileError?.message || retryCompileError}).`
+          );
+        }
+        hub = retryHub;
+        loadNotes.push(`fp16 compile retry -> e:${effectiveEncoderQuant} d:${effectiveDecoderQuant}`);
+      }
+
+      const resolvedQuant = hub?.quantisation
+        ? `resolved e:${hub.quantisation.encoder} d:${hub.quantisation.decoder}`
+        : '';
+      const loadedFiles = hub?.filenames
+        ? `${hub.filenames.encoder}, ${hub.filenames.decoder}`
+        : '';
+      const backendHint = backend.startsWith('webgpu')
+        ? 'decoder executes on WASM in webgpu modes'
+        : '';
+      setResolvedModelInfo([resolvedQuant, loadedFiles, backendHint, ...loadNotes].filter(Boolean).join(' | '));
+
       setModelStatus('Verifying model...');
       setModelProgress('Running reference transcription');
       await verifyModel(modelRef.current);
@@ -733,7 +995,9 @@ export default function App() {
       setModelProgress('');
     } catch (error) {
       console.error(error);
+      const failedModel = modelRef.current;
       modelRef.current = null;
+      await queueModelRelease(failedModel);
       setModelStatus(`Load failed: ${error.message}`);
     } finally {
       setIsLoadingModel(false);
@@ -921,6 +1185,8 @@ export default function App() {
     decode: summarize(okRuns.map((r) => r.metrics?.decode_ms)),
     tokenize: summarize(okRuns.map((r) => r.metrics?.tokenize_ms)),
     rtf: summarize(okRuns.map((r) => r.metrics?.rtf)),
+    encodeRtfx: summarize(okRuns.map((r) => calcRtfx(r.audioDurationSec, r.metrics?.encode_ms))),
+    decodeRtfx: summarize(okRuns.map((r) => calcRtfx(r.audioDurationSec, r.metrics?.decode_ms))),
   }), [okRuns]);
 
   const repeatability = useMemo(() => {
@@ -941,6 +1207,8 @@ export default function App() {
         preprocess: [],
         encode: [],
         decode: [],
+        encodeRtfx: [],
+        decodeRtfx: [],
         total: [],
         exact: [],
         sim: [],
@@ -949,6 +1217,10 @@ export default function App() {
       if (Number.isFinite(run.metrics?.preprocess_ms)) entry.preprocess.push(run.metrics.preprocess_ms);
       if (Number.isFinite(run.metrics?.encode_ms)) entry.encode.push(run.metrics.encode_ms);
       if (Number.isFinite(run.metrics?.decode_ms)) entry.decode.push(run.metrics.decode_ms);
+      const encodeRtfx = calcRtfx(run.audioDurationSec, run.metrics?.encode_ms);
+      const decodeRtfx = calcRtfx(run.audioDurationSec, run.metrics?.decode_ms);
+      if (Number.isFinite(encodeRtfx)) entry.encodeRtfx.push(encodeRtfx);
+      if (Number.isFinite(decodeRtfx)) entry.decodeRtfx.push(decodeRtfx);
       if (Number.isFinite(run.metrics?.total_ms)) entry.total.push(run.metrics.total_ms);
       if (typeof run.exactMatchToFirst === 'boolean') entry.exact.push(run.exactMatchToFirst ? 1 : 0);
       if (Number.isFinite(run.similarityToFirst)) entry.sim.push(run.similarityToFirst);
@@ -965,6 +1237,10 @@ export default function App() {
       preprocessMean: entry.preprocess.length ? mean(entry.preprocess) : null,
       encodeMean: entry.encode.length ? mean(entry.encode) : null,
       decodeMean: entry.decode.length ? mean(entry.decode) : null,
+      encodeRtfxMean: entry.encodeRtfx.length ? mean(entry.encodeRtfx) : null,
+      decodeRtfxMean: entry.decodeRtfx.length ? mean(entry.decodeRtfx) : null,
+      encodeRtfxStd: entry.encodeRtfx.length ? stddev(entry.encodeRtfx) : null,
+      decodeRtfxStd: entry.decodeRtfx.length ? stddev(entry.decodeRtfx) : null,
       decodeStd: entry.decode.length ? stddev(entry.decode) : null,
       totalMean: entry.total.length ? mean(entry.total) : null,
     })).sort((a, b) => (a.exactRate ?? 1) - (b.exactRate ?? 1));
@@ -1058,25 +1334,121 @@ export default function App() {
       },
     };
 
-    const durDecBase = chartBase('Decode (ms)');
-    const durDec = {
+    const rtfxRunOrderBase = chartBase('RTFx');
+    const rtfxRunOrderPoints = okRuns.map((run, idx) => ({
+      runOrder: idx + 1,
+      sampleKey: run.sampleKey,
+      repeatIndex: run.repeatIndex,
+      encoderRtfx: calcRtfx(run.audioDurationSec, run.metrics?.encode_ms),
+      decoderRtfx: calcRtfx(run.audioDurationSec, run.metrics?.decode_ms),
+    }));
+    const rtfxRunOrder = {
       type: 'scatter',
       data: {
-        datasets: [{
-          label: 'Duration vs decoder',
-          backgroundColor: 'rgba(121, 194, 159, 0.72)',
-          pointRadius: 4,
-          data: okRuns
-            .filter((r) => Number.isFinite(r.audioDurationSec) && Number.isFinite(r.metrics?.decode_ms))
-            .map((r) => ({ x: r.audioDurationSec, y: r.metrics.decode_ms, sampleKey: r.sampleKey, repeatIndex: r.repeatIndex })),
-        }],
+        datasets: [
+          {
+            label: 'Encoder RTFx',
+            backgroundColor: 'rgba(124, 166, 220, 0.78)',
+            pointRadius: 3,
+            data: rtfxRunOrderPoints
+              .filter((point) => Number.isFinite(point.encoderRtfx))
+              .map((point) => ({
+                x: point.runOrder,
+                y: point.encoderRtfx,
+                sampleKey: point.sampleKey,
+                repeatIndex: point.repeatIndex,
+              })),
+          },
+          {
+            label: 'Decoder RTFx',
+            backgroundColor: 'rgba(121, 194, 159, 0.78)',
+            pointRadius: 3,
+            data: rtfxRunOrderPoints
+              .filter((point) => Number.isFinite(point.decoderRtfx))
+              .map((point) => ({
+                x: point.runOrder,
+                y: point.decoderRtfx,
+                sampleKey: point.sampleKey,
+                repeatIndex: point.repeatIndex,
+              })),
+          },
+        ],
       },
       options: {
-        ...durDecBase,
+        ...rtfxRunOrderBase,
+        plugins: {
+          ...rtfxRunOrderBase.plugins,
+          tooltip: {
+            ...rtfxRunOrderBase.plugins.tooltip,
+            callbacks: {
+              label: (ctx) => {
+                const point = ctx.raw;
+                return `${ctx.dataset.label}: run #${point.x} (${point.sampleKey}, repeat ${point.repeatIndex}) => ${point.y.toFixed(2)}x`;
+              },
+            },
+          },
+        },
         scales: {
-          ...durDecBase.scales,
+          ...rtfxRunOrderBase.scales,
           x: {
-            ...durDecBase.scales.x,
+            ...rtfxRunOrderBase.scales.x,
+            title: { display: true, text: 'Run order', color: '#deebff', font: { family: 'IBM Plex Sans', size: 11, weight: '600' } },
+          },
+        },
+      },
+    };
+
+    const rtfxDurationBase = chartBase('RTFx');
+    const rtfxDuration = {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            label: 'Encoder RTFx',
+            backgroundColor: 'rgba(124, 166, 220, 0.72)',
+            pointRadius: 4,
+            data: okRuns
+              .map((run) => ({
+                x: run.audioDurationSec,
+                y: calcRtfx(run.audioDurationSec, run.metrics?.encode_ms),
+                sampleKey: run.sampleKey,
+                repeatIndex: run.repeatIndex,
+              }))
+              .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)),
+          },
+          {
+            label: 'Decoder RTFx',
+            backgroundColor: 'rgba(121, 194, 159, 0.72)',
+            pointRadius: 4,
+            data: okRuns
+              .map((run) => ({
+                x: run.audioDurationSec,
+                y: calcRtfx(run.audioDurationSec, run.metrics?.decode_ms),
+                sampleKey: run.sampleKey,
+                repeatIndex: run.repeatIndex,
+              }))
+              .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)),
+          },
+        ],
+      },
+      options: {
+        ...rtfxDurationBase,
+        plugins: {
+          ...rtfxDurationBase.plugins,
+          tooltip: {
+            ...rtfxDurationBase.plugins.tooltip,
+            callbacks: {
+              label: (ctx) => {
+                const point = ctx.raw;
+                return `${ctx.dataset.label}: ${point.sampleKey} run ${point.repeatIndex}, dur ${point.x.toFixed(2)} s => ${point.y.toFixed(2)}x`;
+              },
+            },
+          },
+        },
+        scales: {
+          ...rtfxDurationBase.scales,
+          x: {
+            ...rtfxDurationBase.scales.x,
             title: { display: true, text: 'Audio duration (s)', color: '#deebff', font: { family: 'IBM Plex Sans', size: 11, weight: '600' } },
           },
         },
@@ -1191,7 +1563,7 @@ export default function App() {
       },
     };
 
-    return { encDec, durDec, durPre, trend, bottleneck, compareStages };
+    return { encDec, rtfxRunOrder, rtfxDuration, durPre, trend, bottleneck, compareStages };
   }, [okRuns, configStats]);
 
   const recentRuns = useMemo(() => [...runs].reverse().slice(0, 50), [runs]);
@@ -1208,6 +1580,8 @@ export default function App() {
     const tokenizeMean = mean(good.map((r) => r.metrics?.tokenize_ms).filter(Number.isFinite));
     const totalMean = mean(good.map((r) => r.metrics?.total_ms).filter(Number.isFinite));
     const rtfMedian = summarize(good.map((r) => r.metrics?.rtf).filter(Number.isFinite)).median;
+    const encodeRtfxSummary = summarize(good.map((r) => calcRtfx(r.audioDurationSec, r.metrics?.encode_ms)).filter(Number.isFinite));
+    const decodeRtfxSummary = summarize(good.map((r) => calcRtfx(r.audioDurationSec, r.metrics?.decode_ms)).filter(Number.isFinite));
     return {
       runCount: good.length,
       errorCount: runs.length - good.length,
@@ -1217,6 +1591,10 @@ export default function App() {
       tokenizeMean,
       totalMean,
       rtfMedian,
+      encodeRtfxMedian: encodeRtfxSummary.median,
+      decodeRtfxMedian: decodeRtfxSummary.median,
+      encodeRtfxStd: encodeRtfxSummary.stddev,
+      decodeRtfxStd: decodeRtfxSummary.stddev,
       exactRate: exactValues.length ? exactValues.filter(Boolean).length / exactValues.length : null,
       similarityMean: simValues.length ? mean(simValues) : null,
       preprocessShare: Number.isFinite(preprocessMean) && Number.isFinite(totalMean) && totalMean > 0 ? preprocessMean / totalMean : null,
@@ -1325,8 +1703,8 @@ export default function App() {
           <label>Model<select value={modelKey} onChange={(e) => setModelKey(e.target.value)} disabled={isLoadingModel || isRunning}>{MODEL_OPTIONS.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label>
           <label>Backend<select value={backend} onChange={(e) => setBackend(e.target.value)} disabled={isLoadingModel || isRunning}>{BACKENDS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
           <div className="row-2">
-            <label>Encoder<select value={encoderQuant} onChange={(e) => setEncoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{QUANTS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-            <label>Decoder<select value={decoderQuant} onChange={(e) => setDecoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{QUANTS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+            <label>Encoder<select value={encoderQuant} onChange={(e) => setEncoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{encoderQuantOptions.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+            <label>Decoder<select value={decoderQuant} onChange={(e) => setDecoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{decoderQuantOptions.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
           </div>
           <label>Preprocessor<select value={preprocessorBackend} onChange={(e) => setPreprocessorBackend(e.target.value)} disabled={isLoadingModel || isRunning}><option value="js">JS (meljs)</option><option value="onnx">ONNX (nemo128.onnx)</option></select></label>
           <label>CPU threads<input type="number" min="1" max="64" value={cpuThreads} onChange={(e) => setCpuThreads(clamp(e.target.value, cpuThreads, 1, 64))} disabled={isLoadingModel || isRunning} /></label>
@@ -1334,6 +1712,7 @@ export default function App() {
           <button className="btn btn-primary" onClick={loadModel} disabled={isLoadingModel || isRunning || isModelReady}>{isLoadingModel ? 'Loading...' : isModelReady ? 'Model ready' : 'Load model'}</button>
           <p className="status-text">{modelStatus}</p>
           {modelProgress ? <p className="subtle">{modelProgress}</p> : null}
+          {resolvedModelInfo ? <p className="subtle">{resolvedModelInfo}</p> : null}
         </section>
 
         <section className="sidebar-section">
@@ -1396,6 +1775,8 @@ export default function App() {
           <div className="kpi-card teal"><div className="kpi-label">Encode</div><div className="kpi-value">{ms(metrics.encode.mean)}</div><div className="kpi-sub">Tokenize {ms(metrics.tokenize.mean)}</div></div>
           <div className="kpi-card orange"><div className="kpi-label">Exact Repeatability</div><div className="kpi-value">{pct(repeatability.exactRate)}</div><div className="kpi-sub">sim {pct(repeatability.similarityMean)}</div></div>
           <div className="kpi-card purple"><div className="kpi-label">RTF Median</div><div className="kpi-value">{Number.isFinite(metrics.rtf.median) ? `${metrics.rtf.median.toFixed(2)}x` : '-'}</div><div className="kpi-sub">duration avg {Number.isFinite(mean(okRuns.map((r) => r.audioDurationSec).filter(Number.isFinite))) ? mean(okRuns.map((r) => r.audioDurationSec).filter(Number.isFinite)).toFixed(2) : '-'} s</div></div>
+          <div className="kpi-card teal"><div className="kpi-label">Encoder RTFx</div><div className="kpi-value">{rtfx(metrics.encodeRtfx.median)}</div><div className="kpi-sub">std {rtfx(metrics.encodeRtfx.stddev)}</div></div>
+          <div className="kpi-card green"><div className="kpi-label">Decoder RTFx</div><div className="kpi-value">{rtfx(metrics.decodeRtfx.median)}</div><div className="kpi-sub">std {rtfx(metrics.decodeRtfx.stddev)}</div></div>
         </div>
 
         <section className="table-panel">
@@ -1420,6 +1801,8 @@ export default function App() {
                   <tr><td>Encode mean</td><td>{ms(compareA.summary?.encodeMean)}</td><td>{ms(compareB.summary?.encodeMean)}</td><td>{deltaPercent(compareA.summary?.encodeMean, compareB.summary?.encodeMean, true)}</td></tr>
                   <tr><td>Decode mean</td><td>{ms(compareA.summary?.decodeMean)}</td><td>{ms(compareB.summary?.decodeMean)}</td><td>{deltaPercent(compareA.summary?.decodeMean, compareB.summary?.decodeMean, true)}</td></tr>
                   <tr><td>RTF median</td><td>{Number.isFinite(compareA.summary?.rtfMedian) ? `${compareA.summary.rtfMedian.toFixed(2)}x` : '-'}</td><td>{Number.isFinite(compareB.summary?.rtfMedian) ? `${compareB.summary.rtfMedian.toFixed(2)}x` : '-'}</td><td>{deltaPercent(compareA.summary?.rtfMedian, compareB.summary?.rtfMedian, false)}</td></tr>
+                  <tr><td>Encoder RTFx median</td><td>{rtfx(compareA.summary?.encodeRtfxMedian)}</td><td>{rtfx(compareB.summary?.encodeRtfxMedian)}</td><td>{deltaPercent(compareA.summary?.encodeRtfxMedian, compareB.summary?.encodeRtfxMedian, false)}</td></tr>
+                  <tr><td>Decoder RTFx median</td><td>{rtfx(compareA.summary?.decodeRtfxMedian)}</td><td>{rtfx(compareB.summary?.decodeRtfxMedian)}</td><td>{deltaPercent(compareA.summary?.decodeRtfxMedian, compareB.summary?.decodeRtfxMedian, false)}</td></tr>
                   <tr><td>Exact repeatability</td><td>{pct(compareA.summary?.exactRate)}</td><td>{pct(compareB.summary?.exactRate)}</td><td>{deltaPercent(compareA.summary?.exactRate, compareB.summary?.exactRate, false)}</td></tr>
                   <tr><td>Similarity mean</td><td>{pct(compareA.summary?.similarityMean)}</td><td>{pct(compareB.summary?.similarityMean)}</td><td>{deltaPercent(compareA.summary?.similarityMean, compareB.summary?.similarityMean, false)}</td></tr>
                   <tr><td>Runs</td><td>{compareA.summary?.runCount ?? '-'}</td><td>{compareB.summary?.runCount ?? '-'}</td><td>-</td></tr>
@@ -1432,7 +1815,8 @@ export default function App() {
         {chartConfigs ? (
           <div className="chart-grid">
             <ChartCard title="Encoder vs Decoder" badge="scatter" config={chartConfigs.encDec} />
-            <ChartCard title="Audio Duration vs Decoder" badge="scatter" config={chartConfigs.durDec} />
+            <ChartCard title="Run Order vs Stage RTFx" badge="scatter" config={chartConfigs.rtfxRunOrder} />
+            <ChartCard title="Audio Duration vs Stage RTFx" badge="scatter" config={chartConfigs.rtfxDuration} />
             <ChartCard title="Audio Duration vs Preprocess" badge="scatter" config={chartConfigs.durPre} />
             <ChartCard title="Repeat Trend" badge="mean" config={chartConfigs.trend} />
             <ChartCard title="Stage Bottleneck Share" badge="doughnut" config={chartConfigs.bottleneck} />
@@ -1447,10 +1831,10 @@ export default function App() {
           <div className="table-wrap">
             {sampleStats.length ? (
               <table>
-                <thead><tr><th>Sample</th><th>Runs</th><th>Unique</th><th>Exact</th><th>Similarity</th><th>Preproc mean</th><th>Encode mean</th><th>Decode mean</th><th>Decode std</th><th>Total mean</th></tr></thead>
+                <thead><tr><th>Sample</th><th>Runs</th><th>Unique</th><th>Exact</th><th>Similarity</th><th>Preproc mean</th><th>Encode mean</th><th>Decode mean</th><th>Decode std</th><th>Enc RTFx</th><th>Enc RTFx std</th><th>Dec RTFx</th><th>Dec RTFx std</th><th>Total mean</th></tr></thead>
                 <tbody>
                   {sampleStats.map((s) => (
-                    <tr key={s.sampleKey}><td>{s.sampleKey}</td><td>{s.runs}</td><td>{s.uniqueOutputs}</td><td>{pct(s.exactRate)}</td><td>{pct(s.similarity)}</td><td>{ms(s.preprocessMean)}</td><td>{ms(s.encodeMean)}</td><td>{ms(s.decodeMean)}</td><td>{ms(s.decodeStd)}</td><td>{ms(s.totalMean)}</td></tr>
+                    <tr key={s.sampleKey}><td>{s.sampleKey}</td><td>{s.runs}</td><td>{s.uniqueOutputs}</td><td>{pct(s.exactRate)}</td><td>{pct(s.similarity)}</td><td>{ms(s.preprocessMean)}</td><td>{ms(s.encodeMean)}</td><td>{ms(s.decodeMean)}</td><td>{ms(s.decodeStd)}</td><td>{rtfx(s.encodeRtfxMean)}</td><td>{rtfx(s.encodeRtfxStd)}</td><td>{rtfx(s.decodeRtfxMean)}</td><td>{rtfx(s.decodeRtfxStd)}</td><td>{ms(s.totalMean)}</td></tr>
                   ))}
                 </tbody>
               </table>
@@ -1509,10 +1893,10 @@ export default function App() {
           <div className="table-wrap">
             {recentRuns.length ? (
               <table>
-                <thead><tr><th>Run</th><th>Sample</th><th>Repeat</th><th>Duration</th><th>Preproc</th><th>Encode</th><th>Decode</th><th>Tokenize</th><th>Total</th><th>RTF</th><th>Exact</th><th>Sim</th><th>Error</th></tr></thead>
+                <thead><tr><th>Run</th><th>Sample</th><th>Repeat</th><th>Duration</th><th>Preproc</th><th>Encode</th><th>Decode</th><th>Tokenize</th><th>Total</th><th>RTF</th><th>Enc RTFx</th><th>Dec RTFx</th><th>Exact</th><th>Sim</th><th>Error</th></tr></thead>
                 <tbody>
                   {recentRuns.map((r) => (
-                    <tr key={r.id} className={r.error ? 'row-error' : ''}><td>{r.id}</td><td>{r.sampleKey}</td><td>{r.repeatIndex}</td><td>{Number.isFinite(r.audioDurationSec) ? `${r.audioDurationSec.toFixed(2)} s` : '-'}</td><td>{ms(r.metrics?.preprocess_ms)}</td><td>{ms(r.metrics?.encode_ms)}</td><td>{ms(r.metrics?.decode_ms)}</td><td>{ms(r.metrics?.tokenize_ms)}</td><td>{ms(r.metrics?.total_ms)}</td><td>{Number.isFinite(r.metrics?.rtf) ? `${r.metrics.rtf.toFixed(2)}x` : '-'}</td><td>{typeof r.exactMatchToFirst === 'boolean' ? (r.exactMatchToFirst ? 'yes' : 'no') : '-'}</td><td>{Number.isFinite(r.similarityToFirst) ? `${(r.similarityToFirst * 100).toFixed(1)}%` : '-'}</td><td className="text-cell">{r.error || '-'}</td></tr>
+                    <tr key={r.id} className={r.error ? 'row-error' : ''}><td>{r.id}</td><td>{r.sampleKey}</td><td>{r.repeatIndex}</td><td>{Number.isFinite(r.audioDurationSec) ? `${r.audioDurationSec.toFixed(2)} s` : '-'}</td><td>{ms(r.metrics?.preprocess_ms)}</td><td>{ms(r.metrics?.encode_ms)}</td><td>{ms(r.metrics?.decode_ms)}</td><td>{ms(r.metrics?.tokenize_ms)}</td><td>{ms(r.metrics?.total_ms)}</td><td>{Number.isFinite(r.metrics?.rtf) ? `${r.metrics.rtf.toFixed(2)}x` : '-'}</td><td>{rtfx(calcRtfx(r.audioDurationSec, r.metrics?.encode_ms))}</td><td>{rtfx(calcRtfx(r.audioDurationSec, r.metrics?.decode_ms))}</td><td>{typeof r.exactMatchToFirst === 'boolean' ? (r.exactMatchToFirst ? 'yes' : 'no') : '-'}</td><td>{Number.isFinite(r.similarityToFirst) ? `${(r.similarityToFirst * 100).toFixed(1)}%` : '-'}</td><td className="text-cell">{r.error || '-'}</td></tr>
                   ))}
                 </tbody>
               </table>
