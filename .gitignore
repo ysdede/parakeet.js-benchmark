@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build and Distribution
+dist/
+
+# Environment and Local Config
+.env
+.env.development.local
+.env.local
+.env.production.local
+.env.test.local
+*.pem
+
+# Documentation and Scripts
+docs/
+scripts/
+.typedoc-site/
+
+# Internal
+*OPTIMIZATION*.md
+audio/
+*.pyc
+traces/
