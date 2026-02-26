@@ -24,6 +24,9 @@ import './App.css';
 
 const SETTINGS_KEY = 'parakeet.benchmark.settings.v1';
 const SNAPSHOTS_KEY = 'parakeet.benchmark.snapshots.v1';
+const DATASET_SPLITS_CACHE_PREFIX = 'parakeet.dataset.splits.v1:';
+const DATASET_INFO_CACHE_PREFIX = 'parakeet.dataset.info.v1:';
+const DATASET_META_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const MAX_SNAPSHOTS = 20;
 
 const MODEL_OPTIONS = Object.entries(MODELS).map(([key, config]) => ({
@@ -34,6 +37,7 @@ const MODEL_OPTIONS = Object.entries(MODELS).map(([key, config]) => ({
 const BACKENDS = ['webgpu-hybrid', 'webgpu', 'wasm'];
 const QUANTS = ['fp32', 'int8', 'fp16'];
 const PREPROCESSOR_MODEL = 'nemo128';
+const WARMUP_AUDIO_FALLBACK_URL = 'https://raw.githubusercontent.com/ysdede/parakeet.js/master/examples/demo/public/assets/life_Jim.wav';
 
 function clamp(value, fallback, min, max) {
   const num = Number(value);
@@ -65,6 +69,14 @@ function saveText(fileName, content, type) {
   a.download = fileName;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function getWarmupAudioCandidates() {
+  const base = import.meta.env.BASE_URL || '/';
+  return [
+    `${base}assets/life_Jim.wav`,
+    WARMUP_AUDIO_FALLBACK_URL,
+  ];
 }
 
 const AUDIO_CACHE_DB = 'parakeet-benchmark-cache';
@@ -191,6 +203,54 @@ function loadSnapshots() {
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
+  }
+}
+
+function toCacheKey(prefix, ...parts) {
+  return `${prefix}${parts.map((part) => encodeURIComponent(String(part))).join('::')}`;
+}
+
+function readCacheEntry(key) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.savedAt !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeCacheEntry(key, data) {
+  try {
+    localStorage.setItem(key, JSON.stringify({
+      savedAt: Date.now(),
+      data,
+    }));
+  } catch {
+    // Ignore storage quota / serialization errors.
+  }
+}
+
+function isFresh(entry, ttlMs = DATASET_META_CACHE_TTL_MS) {
+  return !!entry && (Date.now() - entry.savedAt) <= ttlMs;
+}
+
+async function readThroughCache({ key, fetcher, ttlMs = DATASET_META_CACHE_TTL_MS, forceRefresh = false }) {
+  const cached = readCacheEntry(key);
+  if (!forceRefresh && isFresh(cached, ttlMs)) {
+    return { data: cached.data, fromCache: true, stale: false };
+  }
+
+  try {
+    const data = await fetcher();
+    writeCacheEntry(key, data);
+    return { data, fromCache: false, stale: false };
+  } catch (error) {
+    if (cached?.data) {
+      return { data: cached.data, fromCache: true, stale: true, error };
+    }
+    throw error;
   }
 }
 
@@ -442,11 +502,17 @@ export default function App() {
     if (!compareBId) setCompareBId(snapshots[1]?.id || snapshots[0].id);
   }, [snapshots, compareAId, compareBId]);
 
-  async function refreshDatasetMeta(nextDataset = datasetId, nextConfig = datasetConfig, nextSplit = datasetSplit) {
+  async function refreshDatasetMeta(nextDataset = datasetId, nextConfig = datasetConfig, nextSplit = datasetSplit, forceRefresh = false) {
     setIsLoadingDataset(true);
     setDatasetStatus('Loading dataset metadata...');
     try {
-      const splitItems = await fetchDatasetSplits(nextDataset);
+      const splitsCacheKey = toCacheKey(DATASET_SPLITS_CACHE_PREFIX, nextDataset);
+      const splitsResult = await readThroughCache({
+        key: splitsCacheKey,
+        fetcher: () => fetchDatasetSplits(nextDataset),
+        forceRefresh,
+      });
+      const splitItems = splitsResult.data || [];
       const map = getConfigsAndSplits(splitItems);
       const allConfigs = Array.from(map.keys());
       const safeConfig = allConfigs.includes(nextConfig) ? nextConfig : (allConfigs[0] || 'default');
@@ -458,10 +524,19 @@ export default function App() {
       setDatasetConfig(safeConfig);
       setDatasetSplit(safeSplit);
 
-      const info = await fetchDatasetInfo(nextDataset, safeConfig);
+      const infoCacheKey = toCacheKey(DATASET_INFO_CACHE_PREFIX, nextDataset, safeConfig);
+      const infoResult = await readThroughCache({
+        key: infoCacheKey,
+        fetcher: () => fetchDatasetInfo(nextDataset, safeConfig),
+        forceRefresh,
+      });
+      const info = infoResult.data || {};
       setFeatures(Object.keys(info?.dataset_info?.features || {}));
       setSplitCounts(info?.dataset_info?.splits || {});
-      setDatasetStatus(`Ready: ${safeConfig}/${safeSplit}`);
+      const usedCache = splitsResult.fromCache || infoResult.fromCache;
+      const staleCache = splitsResult.stale || infoResult.stale;
+      const mode = staleCache ? 'cache-stale' : (usedCache ? 'cache' : 'live');
+      setDatasetStatus(`Ready: ${safeConfig}/${safeSplit} (${mode})`);
     } catch (error) {
       console.error(error);
       setDatasetStatus(`Metadata failed: ${error.message}`);
@@ -589,7 +664,20 @@ export default function App() {
 
   async function verifyModel(model) {
     const expectedText = 'it is not life as we know or understand it';
-    const sample = await decodeAudio('/assets/life_Jim.wav');
+    let sample = null;
+    let lastError = null;
+    const warmupSources = getWarmupAudioCandidates();
+    for (const src of warmupSources) {
+      try {
+        sample = await decodeAudio(src);
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!sample) {
+      throw lastError || new Error('Warmup audio could not be loaded');
+    }
     const result = await model.transcribe(sample.pcm, sample.sampleRate, {
       enableProfiling: false,
       returnConfidences: false,
@@ -1251,7 +1339,7 @@ export default function App() {
         <section className="sidebar-section">
           <h2>Dataset</h2>
           <label>Dataset<input value={datasetId} onChange={(e) => setDatasetId(e.target.value)} disabled={isLoadingDataset || isRunning} /></label>
-          <button className="btn" onClick={() => refreshDatasetMeta(datasetId, datasetConfig, datasetSplit)} disabled={isLoadingDataset || isRunning}>{isLoadingDataset ? 'Refreshing...' : 'Refresh metadata'}</button>
+          <button className="btn" onClick={() => refreshDatasetMeta(datasetId, datasetConfig, datasetSplit, true)} disabled={isLoadingDataset || isRunning}>{isLoadingDataset ? 'Refreshing...' : 'Refresh metadata'}</button>
           <div className="row-2">
             <label>Config<select value={datasetConfig} onChange={(e) => refreshDatasetMeta(datasetId, e.target.value, datasetSplit)} disabled={isLoadingDataset || isRunning}>{configs.map((c) => <option key={c} value={c}>{c}</option>)}</select></label>
             <label>Split<select value={datasetSplit} onChange={(e) => setDatasetSplit(e.target.value)} disabled={isLoadingDataset || isRunning}>{splits.map((s) => <option key={s} value={s}>{s}</option>)}</select></label>

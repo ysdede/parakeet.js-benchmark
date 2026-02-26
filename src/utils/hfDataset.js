@@ -1,4 +1,8 @@
 const HF_DATASET_API = 'https://datasets-server.huggingface.co';
+const MIN_REQUEST_GAP_MS = 500;
+
+let lastRequestAt = 0;
+let requestQueue = Promise.resolve();
 
 function buildUrl(path, params) {
   const url = new URL(`${HF_DATASET_API}${path}`);
@@ -14,18 +18,49 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function enqueueRequest(task) {
+  const run = requestQueue
+    .catch(() => {})
+    .then(async () => {
+      const now = Date.now();
+      const elapsed = now - lastRequestAt;
+      if (elapsed < MIN_REQUEST_GAP_MS) {
+        await sleep(MIN_REQUEST_GAP_MS - elapsed);
+      }
+      const result = await task();
+      lastRequestAt = Date.now();
+      return result;
+    });
+  requestQueue = run.catch(() => {});
+  return run;
+}
+
+function parseRetryAfterMs(response, fallbackMs) {
+  const retryAfter = response.headers?.get('retry-after');
+  if (!retryAfter) return fallbackMs;
+  const asSec = Number(retryAfter);
+  if (Number.isFinite(asSec)) return Math.max(fallbackMs, asSec * 1000);
+  const asDate = Date.parse(retryAfter);
+  if (Number.isFinite(asDate)) {
+    const diff = asDate - Date.now();
+    return Number.isFinite(diff) ? Math.max(fallbackMs, diff) : fallbackMs;
+  }
+  return fallbackMs;
+}
+
 async function fetchJson(url, options = {}) {
-  const { retries = 2, retryDelayMs = 220 } = options;
+  const { retries = 2, retryDelayMs = 700 } = options;
   let lastError = null;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      const response = await fetch(url);
+      const response = await enqueueRequest(() => fetch(url));
       if (!response.ok) {
         const bodyText = await response.text();
         const shouldRetry = response.status >= 500 || response.status === 429;
         if (shouldRetry && attempt < retries) {
-          await sleep(retryDelayMs * (attempt + 1));
+          const backoff = parseRetryAfterMs(response, retryDelayMs * (attempt + 1));
+          await sleep(backoff);
           continue;
         }
         throw new Error(`Request failed (${response.status}): ${bodyText}`);
@@ -34,7 +69,11 @@ async function fetchJson(url, options = {}) {
     } catch (error) {
       lastError = error;
       if (attempt >= retries) break;
-      await sleep(retryDelayMs * (attempt + 1));
+      const isNetwork = /Failed to fetch|NetworkError|Load failed|CORS|ERR_FAILED/i.test(String(error?.message || error));
+      const backoff = isNetwork
+        ? Math.max(1200, retryDelayMs * (attempt + 1) * 2)
+        : retryDelayMs * (attempt + 1);
+      await sleep(backoff);
     }
   }
 
@@ -181,31 +220,52 @@ export async function fetchRandomRows({ dataset, config, split, totalRows, sampl
   const wanted = Math.min(targetCount, maxRows);
   const seedValue = normalizeSeed(seed);
   const rand = seedValue === null ? Math.random : createMulberry32(seedValue);
-  const attemptedOffsets = new Set();
+  const requestedOffsets = [];
+  const selectedOffsets = new Set();
   const successfulOffsets = [];
   const failedOffsets = [];
   const rows = [];
 
-  const maxAttempts = Math.min(maxRows * 3, maxRows + wanted * 20);
-  let attempts = 0;
+  const maxOffsetAttempts = Math.min(maxRows * 3, maxRows + wanted * 20);
+  let offsetAttempts = 0;
 
-  while (rows.length < wanted && attempts < maxAttempts && attemptedOffsets.size < maxRows) {
-    attempts += 1;
+  while (selectedOffsets.size < wanted && offsetAttempts < maxOffsetAttempts && selectedOffsets.size < maxRows) {
+    offsetAttempts += 1;
     const offset = Math.floor(rand() * maxRows);
-    if (attemptedOffsets.has(offset)) continue;
-    attemptedOffsets.add(offset);
+    if (selectedOffsets.has(offset)) continue;
+    selectedOffsets.add(offset);
+    requestedOffsets.push(offset);
+  }
+
+  const pageMap = new Map();
+  requestedOffsets.forEach((offset) => {
+    const pageStart = Math.floor(offset / 100) * 100;
+    const list = pageMap.get(pageStart) || [];
+    list.push(offset);
+    pageMap.set(pageStart, list);
+  });
+
+  const pageStarts = Array.from(pageMap.keys()).sort((a, b) => a - b);
+  for (const pageStart of pageStarts) {
+    if (rows.length >= wanted) break;
 
     try {
-      const page = await fetchDatasetRows({ dataset, config, split, offset, length: 1 });
-      const row = page.rows?.[0];
-      if (!row) {
-        failedOffsets.push(offset);
-        continue;
+      const page = await fetchDatasetRows({ dataset, config, split, offset: pageStart, length: 100 });
+      const pageRows = page.rows || [];
+      const offsetsInPage = pageMap.get(pageStart) || [];
+      for (const absoluteOffset of offsetsInPage) {
+        if (rows.length >= wanted) break;
+        const row = pageRows[absoluteOffset - pageStart];
+        if (!row) {
+          failedOffsets.push(absoluteOffset);
+          continue;
+        }
+        rows.push(row);
+        successfulOffsets.push(absoluteOffset);
       }
-      rows.push(row);
-      successfulOffsets.push(offset);
     } catch {
-      failedOffsets.push(offset);
+      const offsetsInPage = pageMap.get(pageStart) || [];
+      failedOffsets.push(...offsetsInPage);
     }
   }
 
