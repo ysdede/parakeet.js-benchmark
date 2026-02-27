@@ -591,6 +591,9 @@ export default function App() {
   const [showPreparedSamples, setShowPreparedSamples] = useState(false);
   const [activeTab, setActiveTab] = useState('benchmark');
   const [theme, setTheme] = useState(() => localStorage.getItem('parakeet-theme') || 'dark');
+  const [pivotGroupBy, setPivotGroupBy] = useState('quant');
+  const [pivotMetrics, setPivotMetrics] = useState(['totalMean', 'encodeMean', 'decodeMean', 'rtfMedian']);
+  const fileInputRef = useRef(null);
   const [hardwareProfile, setHardwareProfile] = useState(null);
   const [hardwareStatus, setHardwareStatus] = useState('');
   const [isLoadingHardware, setIsLoadingHardware] = useState(false);
@@ -2087,6 +2090,139 @@ export default function App() {
     });
   }
 
+  // ═══ Pivot Table Config ═══
+  const PIVOT_DIMENSIONS = [
+    { key: 'model', label: 'Model', extract: (s) => s.settings?.modelKey || '-' },
+    { key: 'backend', label: 'Backend', extract: (s) => s.settings?.backend || '-' },
+    { key: 'quant', label: 'Quantization', extract: (s) => `e:${s.settings?.encoderQuant || '-'} d:${s.settings?.decoderQuant || '-'}` },
+    { key: 'encoderQuant', label: 'Encoder Quant', extract: (s) => s.settings?.encoderQuant || '-' },
+    { key: 'decoderQuant', label: 'Decoder Quant', extract: (s) => s.settings?.decoderQuant || '-' },
+    { key: 'preprocessor', label: 'Preprocessor', extract: (s) => s.settings?.preprocessorBackend || '-' },
+    { key: 'gpu', label: 'GPU', extract: (s) => s.hardwareSummary?.gpuModelLabel || s.hardwareSummary?.gpuLabel || '-' },
+    { key: 'cpu', label: 'CPU', extract: (s) => s.hardwareSummary?.cpuLabel || '-' },
+    { key: 'dataset', label: 'Dataset', extract: (s) => `${s.settings?.datasetId || '-'}/${s.settings?.datasetConfig || '-'}` },
+  ];
+
+  const PIVOT_METRICS = [
+    { key: 'totalMean', label: 'Total (ms)', format: ms, lowerBetter: true },
+    { key: 'preprocessMean', label: 'Preprocess (ms)', format: ms, lowerBetter: true },
+    { key: 'encodeMean', label: 'Encode (ms)', format: ms, lowerBetter: true },
+    { key: 'decodeMean', label: 'Decode (ms)', format: ms, lowerBetter: true },
+    { key: 'tokenizeMean', label: 'Tokenize (ms)', format: ms, lowerBetter: true },
+    { key: 'rtfMedian', label: 'RTF Median', format: (v) => Number.isFinite(v) ? `${v.toFixed(2)}×` : '-', lowerBetter: false },
+    { key: 'encodeRtfxMedian', label: 'Enc RTFx', format: rtfx, lowerBetter: false },
+    { key: 'decodeRtfxMedian', label: 'Dec RTFx', format: rtfx, lowerBetter: false },
+    { key: 'exactRate', label: 'Exact %', format: pct, lowerBetter: false },
+    { key: 'similarityMean', label: 'Sim %', format: pct, lowerBetter: false },
+    { key: 'runCount', label: 'Runs', format: (v) => v ?? '-', lowerBetter: false },
+  ];
+
+  function togglePivotMetric(key) {
+    setPivotMetrics((prev) => prev.includes(key) ? (prev.length > 1 ? prev.filter((k) => k !== key) : prev) : [...prev, key]);
+  }
+
+  function importJsonFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        const runs = data.runs || [];
+        if (!runs.length) { setBenchStatus('No runs found in JSON'); return; }
+        const good = runs.filter((r) => !r.error && r.metrics && Number.isFinite(r.metrics.total_ms));
+        const preprocessMean = mean(good.map((r) => r.metrics?.preprocess_ms).filter(Number.isFinite));
+        const encodeMean = mean(good.map((r) => r.metrics?.encode_ms).filter(Number.isFinite));
+        const decodeMean = mean(good.map((r) => r.metrics?.decode_ms).filter(Number.isFinite));
+        const tokenizeMean = mean(good.map((r) => r.metrics?.tokenize_ms).filter(Number.isFinite));
+        const totalMean = mean(good.map((r) => r.metrics?.total_ms).filter(Number.isFinite));
+        const rtfMedian = median(good.map((r) => r.metrics?.rtf).filter(Number.isFinite));
+        const encRtfx = good.map((r) => calcRtfx(r.audioDurationSec, r.metrics?.encode_ms)).filter(Number.isFinite);
+        const decRtfx = good.map((r) => calcRtfx(r.audioDurationSec, r.metrics?.decode_ms)).filter(Number.isFinite);
+        const exactValues = good.map((r) => r.exactMatchToFirst).filter((v) => typeof v === 'boolean');
+        const simValues = good.map((r) => r.similarityToFirst).filter(Number.isFinite);
+        const summary = {
+          runCount: good.length,
+          errorCount: runs.length - good.length,
+          preprocessMean,
+          encodeMean,
+          decodeMean,
+          tokenizeMean,
+          totalMean,
+          rtfMedian,
+          encodeRtfxMedian: median(encRtfx),
+          decodeRtfxMedian: median(decRtfx),
+          exactRate: exactValues.length ? exactValues.filter(Boolean).length / exactValues.length : null,
+          similarityMean: simValues.length ? mean(simValues) : null,
+        };
+        const snapshot = {
+          id: `import-${Date.now()}`,
+          createdAt: data.generatedAt || new Date().toISOString(),
+          label: file.name.replace(/\.json$/i, ''),
+          settings: data.settings || {},
+          summary,
+          hardwareProfile: data.hardwareProfile || null,
+          hardwareSummary: data.hardwareSummary || {},
+          runs: runs.slice(0, 200),
+          imported: true,
+        };
+        setSnapshots((prev) => [snapshot, ...prev].slice(0, MAX_SNAPSHOTS));
+        setBenchStatus(`Imported ${good.length} runs from ${file.name}`);
+      } catch (err) {
+        setBenchStatus(`Import failed: ${err.message}`);
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  }
+
+  const pivotData = useMemo(() => {
+    if (!snapshots.length) return null;
+    const dim = PIVOT_DIMENSIONS.find((d) => d.key === pivotGroupBy) || PIVOT_DIMENSIONS[0];
+    const groups = {};
+    snapshots.forEach((s) => {
+      const key = dim.extract(s);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(s);
+    });
+    const rows = Object.entries(groups).map(([groupKey, items]) => {
+      const row = { groupKey, count: items.length, snapshots: items };
+      PIVOT_METRICS.forEach((m) => {
+        const values = items.map((s) => s.summary?.[m.key]).filter(Number.isFinite);
+        row[m.key] = values.length ? mean(values) : null;
+        row[`${m.key}_min`] = values.length ? Math.min(...values) : null;
+        row[`${m.key}_max`] = values.length ? Math.max(...values) : null;
+        row[`${m.key}_all`] = values;
+      });
+      return row;
+    });
+    return { dim, rows, groups };
+  }, [snapshots, pivotGroupBy]);
+
+  const pivotChartConfig = useMemo(() => {
+    if (!pivotData || !pivotData.rows.length) return null;
+    const labels = pivotData.rows.map((r) => r.groupKey);
+    const activeMetrics = PIVOT_METRICS.filter((m) => pivotMetrics.includes(m.key));
+    const colors = ['rgba(124, 166, 220, 0.82)', 'rgba(121, 194, 159, 0.82)', 'rgba(217, 179, 122, 0.82)', 'rgba(155, 159, 223, 0.82)', 'rgba(224, 107, 127, 0.82)', 'rgba(93, 186, 130, 0.82)'];
+    const datasets = activeMetrics.map((m, i) => ({
+      label: m.label,
+      data: pivotData.rows.map((r) => r[m.key]),
+      backgroundColor: colors[i % colors.length],
+    }));
+    const base = chartBase('Value');
+    return {
+      type: 'bar',
+      data: { labels, datasets },
+      options: {
+        ...base,
+        scales: {
+          ...base.scales,
+          x: { ...base.scales.x, ticks: { color: '#6b7a90', maxRotation: 30, font: { family: 'JetBrains Mono', size: 9 } } },
+        },
+      },
+    };
+  }, [pivotData, pivotMetrics]);
+
   function exportJson() {
     if (!runs.length) return;
     const payload = {
@@ -2378,7 +2514,82 @@ export default function App() {
         {/* ── COMPARE TAB ── */}
         {activeTab === 'compare' && (
           <div className="fade-in">
-            <h3 className="section-title">A/B Snapshot Comparison</h3>
+            {/* ═══ PIVOT TABLE ═══ */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 className="section-title" style={{ margin: 0 }}>Pivot Analysis</h3>
+              <div className="btn-group">
+                <input ref={fileInputRef} type="file" accept=".json" style={{ display: 'none' }} onChange={importJsonFile} />
+                <button className="btn btn-sm" onClick={() => fileInputRef.current?.click()}>Import JSON</button>
+              </div>
+            </div>
+            <div className="pivot-controls">
+              <label className="pivot-group-label">
+                Group by
+                <select value={pivotGroupBy} onChange={(e) => setPivotGroupBy(e.target.value)}>
+                  {PIVOT_DIMENSIONS.map((d) => <option key={d.key} value={d.key}>{d.label}</option>)}
+                </select>
+              </label>
+              <div className="pivot-metric-chips">
+                {PIVOT_METRICS.map((m) => (
+                  <button key={m.key} className={`param-chip ${pivotMetrics.includes(m.key) ? 'active' : ''}`} onClick={() => togglePivotMetric(m.key)}>{m.label}</button>
+                ))}
+              </div>
+            </div>
+
+            {pivotData && pivotData.rows.length > 0 ? (
+              <>
+                <section className="table-panel" style={{ marginBottom: 16 }}>
+                  <div className="table-header">
+                    <h3>Grouped by: {pivotData.dim.label} ({pivotData.rows.length} groups, {snapshots.length} snapshots)</h3>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th style={{ textAlign: 'left' }}>{pivotData.dim.label}</th>
+                          <th>Snaps</th>
+                          {PIVOT_METRICS.filter((m) => pivotMetrics.includes(m.key)).map((m) => (
+                            <th key={m.key}>{m.label}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pivotData.rows.map((row) => {
+                          const activeM = PIVOT_METRICS.filter((m) => pivotMetrics.includes(m.key));
+                          return (
+                            <tr key={row.groupKey}>
+                              <td style={{ textAlign: 'left', fontWeight: 600 }}>{row.groupKey}</td>
+                              <td>{row.count}</td>
+                              {activeM.map((m) => {
+                                const allValues = pivotData.rows.map((r) => r[m.key]).filter(Number.isFinite);
+                                const best = m.lowerBetter ? Math.min(...allValues) : Math.max(...allValues);
+                                const isBest = Number.isFinite(row[m.key]) && row[m.key] === best && allValues.length > 1;
+                                return (
+                                  <td key={m.key} style={isBest ? { color: 'var(--green)', fontWeight: 700 } : {}}>
+                                    {m.format(row[m.key])}
+                                    {row.count > 1 && Number.isFinite(row[`${m.key}_min`]) && Number.isFinite(row[`${m.key}_max`]) && row[`${m.key}_min`] !== row[`${m.key}_max`] ? (
+                                      <span style={{ fontSize: '9px', opacity: 0.6, display: 'block' }}>{m.format(row[`${m.key}_min`])} – {m.format(row[`${m.key}_max`])}</span>
+                                    ) : null}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+                {pivotChartConfig && <div style={{ marginBottom: 24 }}><ChartCard title={`${pivotData.dim.label} Comparison`} badge="grouped" config={pivotChartConfig} /></div>}
+              </>
+            ) : (
+              <div className="empty-state" style={{ marginBottom: 24 }}>
+                <p>Import benchmark JSON files or save snapshots to build pivot comparisons.</p>
+                <p style={{ fontSize: 11, marginTop: 6 }}>Use "Import JSON" to load files from the metrics/ folder, or "Save snapshot" in the Benchmark tab.</p>
+              </div>
+            )}
+
+            <h3 className="section-title" style={{ marginTop: 16 }}>A/B Snapshot Comparison</h3>
             <div className="compare-selectors">
               <label>Snapshot A<select value={compareAId} onChange={(e) => setCompareAId(e.target.value)} disabled={!snapshots.length}>{snapshots.length ? snapshots.map((s) => <option key={s.id} value={s.id}>{s.label}</option>) : <option value="">No snapshots</option>}</select></label>
               <label>Snapshot B<select value={compareBId} onChange={(e) => setCompareBId(e.target.value)} disabled={!snapshots.length}>{snapshots.length ? snapshots.map((s) => <option key={s.id} value={s.id}>{s.label}</option>) : <option value="">No snapshots</option>}</select></label>

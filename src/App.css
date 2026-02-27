@@ -826,6 +826,36 @@ tbody tr:hover td {
   flex-wrap: wrap;
 }
 
+/* ─── PIVOT CONTROLS ─── */
+.pivot-controls {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.pivot-group-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 160px;
+  flex-shrink: 0;
+}
+
+.pivot-metric-chips {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  flex: 1;
+  align-items: flex-end;
+  padding-top: 16px;
+}
+
 /* ─── RESPONSIVE ─── */
 @media (max-width: 1200px) {
   .config-panel {
