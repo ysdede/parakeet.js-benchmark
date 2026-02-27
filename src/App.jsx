@@ -40,6 +40,7 @@ const PREPROCESSOR_MODEL = 'nemo128';
 const WARMUP_AUDIO_FALLBACK_URL = 'https://raw.githubusercontent.com/ysdede/parakeet.js/master/examples/demo/public/assets/life_Jim.wav';
 const QUANTIZATION_ORDER = ['fp16', 'int8', 'fp32'];
 const MODEL_FILES_CACHE = new Map();
+const MODEL_REVISIONS_CACHE = new Map();
 
 function formatRepoPath(repoId) {
   return String(repoId || '')
@@ -105,12 +106,37 @@ async function fetchModelFiles(repoId, revision = 'main') {
   }
 }
 
-function getAvailableQuantModes(files, baseName) {
-  const options = QUANTIZATION_ORDER.filter((quant) => {
-    if (quant === 'fp32') return hasModelFile(files, `${baseName}.onnx`);
-    if (quant === 'fp16') return hasModelFile(files, `${baseName}.fp16.onnx`);
-    return hasModelFile(files, `${baseName}.int8.onnx`);
-  });
+async function fetchModelRevisions(repoId) {
+  if (!repoId) return ['main'];
+  if (MODEL_REVISIONS_CACHE.has(repoId)) return MODEL_REVISIONS_CACHE.get(repoId);
+
+  try {
+    const repoPath = formatRepoPath(repoId);
+    const response = await fetch(`https://huggingface.co/api/models/${repoPath}/refs`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    const branches = Array.isArray(payload?.branches)
+      ? payload.branches.map((branch) => String(branch?.name || '')).filter(Boolean)
+      : [];
+    const revisions = branches.length ? branches : ['main'];
+    MODEL_REVISIONS_CACHE.set(repoId, revisions);
+    return revisions;
+  } catch (error) {
+    console.warn(`[modelSelection] Failed to fetch revisions for ${repoId}; using main`, error);
+    return ['main'];
+  }
+}
+
+function getQuantFlags(files, baseName) {
+  return {
+    fp16: hasModelFile(files, `${baseName}.fp16.onnx`),
+    int8: hasModelFile(files, `${baseName}.int8.onnx`),
+    fp32: hasModelFile(files, `${baseName}.onnx`),
+  };
+}
+
+function quantFlagsToOptions(flags) {
+  const options = QUANTIZATION_ORDER.filter((quant) => Boolean(flags?.[quant]));
   return options.length ? options : ['fp32'];
 }
 
@@ -658,11 +684,41 @@ export default function App() {
     const repoId = MODELS[modelKey]?.repoId || modelKey;
 
     (async () => {
-      const files = await fetchModelFiles(repoId, 'main');
+      const mainFiles = await fetchModelFiles(repoId, 'main');
       if (cancelled) return;
 
-      const encOptions = getAvailableQuantModes(files, 'encoder-model');
-      const decOptions = getAvailableQuantModes(files, 'decoder_joint-model');
+      const encoderFlags = getQuantFlags(mainFiles, 'encoder-model');
+      const decoderFlags = getQuantFlags(mainFiles, 'decoder_joint-model');
+
+      // FP16 weights can live on non-main branches for some repos.
+      const needsBranchScan = !encoderFlags.fp16 || !decoderFlags.fp16;
+      if (needsBranchScan) {
+        const revisions = await fetchModelRevisions(repoId);
+        for (const revision of revisions) {
+          if (cancelled) return;
+          if (!revision || revision === 'main') continue;
+
+          const files = await fetchModelFiles(repoId, revision);
+          const enc = getQuantFlags(files, 'encoder-model');
+          const dec = getQuantFlags(files, 'decoder_joint-model');
+          encoderFlags.fp16 = encoderFlags.fp16 || enc.fp16;
+          encoderFlags.int8 = encoderFlags.int8 || enc.int8;
+          encoderFlags.fp32 = encoderFlags.fp32 || enc.fp32;
+          decoderFlags.fp16 = decoderFlags.fp16 || dec.fp16;
+          decoderFlags.int8 = decoderFlags.int8 || dec.int8;
+          decoderFlags.fp32 = decoderFlags.fp32 || dec.fp32;
+
+          if (
+            encoderFlags.fp16 && encoderFlags.int8 && encoderFlags.fp32 &&
+            decoderFlags.fp16 && decoderFlags.int8 && decoderFlags.fp32
+          ) {
+            break;
+          }
+        }
+      }
+
+      const encOptions = quantFlagsToOptions(encoderFlags);
+      const decOptions = quantFlagsToOptions(decoderFlags);
       setEncoderQuantOptions(encOptions);
       setDecoderQuantOptions(decOptions);
     })();
