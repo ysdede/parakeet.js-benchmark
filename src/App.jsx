@@ -12,7 +12,9 @@ import {
   RUN_CSV_COLUMNS,
   flattenRunRecord,
   mean,
+  median,
   normalizeText,
+  percentile,
   stddev,
   summarize,
   textSimilarity,
@@ -175,6 +177,34 @@ async function clearCachedAudioBlobs() {
   } catch {
     // Ignore IndexedDB cache clear failures.
   }
+}
+
+function linearFit(xArr, yArr) {
+  const n = xArr.length;
+  if (n < 2) return { a: 0, b: 0, r2: 0 };
+  const mx = xArr.reduce((s, v) => s + v, 0) / n;
+  const my = yArr.reduce((s, v) => s + v, 0) / n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) { num += (xArr[i] - mx) * (yArr[i] - my); den += (xArr[i] - mx) ** 2; }
+  const a = den === 0 ? 0 : num / den;
+  const b = my - a * mx;
+  let ssRes = 0, ssTot = 0;
+  for (let i = 0; i < n; i++) { ssRes += (yArr[i] - (a * xArr[i] + b)) ** 2; ssTot += (yArr[i] - my) ** 2; }
+  const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
+  return { a, b, r2 };
+}
+
+function histogram(values, binWidth) {
+  if (!values.length) return { labels: [], counts: [] };
+  const min = Math.floor(Math.min(...values) / binWidth) * binWidth;
+  const max = Math.ceil(Math.max(...values) / binWidth) * binWidth;
+  const labels = [];
+  const counts = [];
+  for (let lo = min; lo < max; lo += binWidth) {
+    labels.push(`${lo}–${lo + binWidth}`);
+    counts.push(values.filter((v) => v >= lo && v < lo + binWidth).length);
+  }
+  return { labels, counts };
 }
 
 function chartBase(yLabel) {
@@ -1567,7 +1597,283 @@ export default function App() {
       },
     };
 
-    return { encDec, rtfxRunOrder, rtfxDuration, durPre, trend, bottleneck, compareStages };
+    // ═══ NEW CHART 1: Duration vs Total + Regression Line ═══
+    const durTotalPoints = okRuns
+      .filter((r) => Number.isFinite(r.audioDurationSec) && Number.isFinite(r.metrics?.total_ms))
+      .map((r) => ({ x: r.audioDurationSec, y: r.metrics.total_ms, sampleKey: r.sampleKey }));
+    const dtX = durTotalPoints.map((p) => p.x);
+    const dtY = durTotalPoints.map((p) => p.y);
+    const dtFit = linearFit(dtX, dtY);
+    const dtLineData = dtX.length ? [
+      { x: Math.min(...dtX), y: dtFit.a * Math.min(...dtX) + dtFit.b },
+      { x: Math.max(...dtX), y: dtFit.a * Math.max(...dtX) + dtFit.b },
+    ] : [];
+    const durTotalBase = chartBase('Total (ms)');
+    const durTotal = {
+      type: 'scatter',
+      data: {
+        datasets: [
+          { label: 'Total ms', backgroundColor: 'rgba(154, 170, 209, 0.72)', pointRadius: 4, data: durTotalPoints },
+          { label: `Fit: ${dtFit.a.toFixed(1)}×dur + ${dtFit.b.toFixed(0)} (R²=${dtFit.r2.toFixed(3)})`, type: 'line', borderColor: 'rgba(224, 169, 78, 0.9)', borderWidth: 2, borderDash: [6, 3], pointRadius: 0, data: dtLineData, fill: false },
+        ],
+      },
+      options: { ...durTotalBase, scales: { ...durTotalBase.scales, x: { ...durTotalBase.scales.x, title: { display: true, text: 'Audio duration (s)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } } } },
+    };
+
+    // ═══ NEW CHART 2: Transcription Length vs Decode ═══
+    const txDecPoints = okRuns
+      .filter((r) => r.transcription && Number.isFinite(r.metrics?.decode_ms))
+      .map((r) => ({ x: r.transcription.length, y: r.metrics.decode_ms, sampleKey: r.sampleKey }));
+    const txDecBase = chartBase('Decode (ms)');
+    const txDecode = {
+      type: 'scatter',
+      data: { datasets: [{ label: 'Transcription length vs decode', backgroundColor: 'rgba(121, 194, 159, 0.72)', pointRadius: 4, data: txDecPoints }] },
+      options: { ...txDecBase, scales: { ...txDecBase.scales, x: { ...txDecBase.scales.x, title: { display: true, text: 'Transcription length (chars)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } } } },
+    };
+
+    // ═══ NEW CHART 3: Phase Timing Box Plots (bar with error bars visualized as ranges) ═══
+    const phaseNames = ['Preprocess', 'Encode', 'Decode', 'Tokenize'];
+    const phaseFields = ['preprocess_ms', 'encode_ms', 'decode_ms', 'tokenize_ms'];
+    const phaseColors = ['rgba(217, 179, 122, 0.82)', 'rgba(124, 166, 220, 0.82)', 'rgba(121, 194, 159, 0.82)', 'rgba(154, 170, 209, 0.82)'];
+    const phaseData = phaseFields.map((f) => okRuns.map((r) => r.metrics?.[f]).filter(Number.isFinite));
+    const phaseBoxBase = chartBase('Time (ms)');
+    const phaseBox = {
+      type: 'bar',
+      data: {
+        labels: phaseNames,
+        datasets: [
+          { label: 'p25', data: phaseData.map((d) => percentile(d, 25)), backgroundColor: 'transparent', borderWidth: 0, barPercentage: 0.6 },
+          { label: 'Median', data: phaseData.map((d) => median(d) - (percentile(d, 25) || 0)), backgroundColor: phaseColors, borderWidth: 0, barPercentage: 0.6 },
+          { label: 'p75', data: phaseData.map((d) => (percentile(d, 75) || 0) - (median(d) || 0)), backgroundColor: phaseColors.map((c) => c.replace('0.82', '0.45')), borderWidth: 0, barPercentage: 0.6 },
+        ],
+      },
+      options: {
+        ...phaseBoxBase,
+        scales: {
+          ...phaseBoxBase.scales,
+          x: { ...phaseBoxBase.scales.x, stacked: true },
+          y: { ...phaseBoxBase.scales.y, stacked: true },
+        },
+        plugins: {
+          ...phaseBoxBase.plugins,
+          tooltip: {
+            ...phaseBoxBase.plugins.tooltip,
+            callbacks: {
+              label: (ctx) => {
+                const idx = ctx.dataIndex;
+                const d = phaseData[idx];
+                if (!d.length) return '-';
+                return `${phaseNames[idx]}: p25=${percentile(d, 25)?.toFixed(1)} med=${median(d)?.toFixed(1)} p75=${percentile(d, 75)?.toFixed(1)} min=${Math.min(...d).toFixed(1)} max=${Math.max(...d).toFixed(1)} std=${stddev(d).toFixed(1)}`;
+              },
+            },
+          },
+          legend: { display: false },
+        },
+      },
+    };
+
+    // ═══ NEW CHART 4: Duration Bucket Breakdown ═══
+    const bucketWidth = 4;
+    const bucketMap = {};
+    okRuns.forEach((r) => {
+      if (!Number.isFinite(r.audioDurationSec)) return;
+      const b = Math.floor(r.audioDurationSec / bucketWidth) * bucketWidth;
+      if (!bucketMap[b]) bucketMap[b] = { preprocess: [], encode: [], decode: [] };
+      if (Number.isFinite(r.metrics?.preprocess_ms)) bucketMap[b].preprocess.push(r.metrics.preprocess_ms);
+      if (Number.isFinite(r.metrics?.encode_ms)) bucketMap[b].encode.push(r.metrics.encode_ms);
+      if (Number.isFinite(r.metrics?.decode_ms)) bucketMap[b].decode.push(r.metrics.decode_ms);
+    });
+    const bucketKeys = Object.keys(bucketMap).map(Number).sort((a, b) => a - b);
+    const bucketLabels = bucketKeys.map((k) => `${k}-${k + bucketWidth}s`);
+    const durationBucketBase = chartBase('Mean (ms)');
+    const durationBucket = {
+      type: 'bar',
+      data: {
+        labels: bucketLabels,
+        datasets: [
+          { label: 'Preprocess', data: bucketKeys.map((k) => mean(bucketMap[k].preprocess)), backgroundColor: 'rgba(217, 179, 122, 0.82)' },
+          { label: 'Encode', data: bucketKeys.map((k) => mean(bucketMap[k].encode)), backgroundColor: 'rgba(124, 166, 220, 0.82)' },
+          { label: 'Decode', data: bucketKeys.map((k) => mean(bucketMap[k].decode)), backgroundColor: 'rgba(121, 194, 159, 0.82)' },
+        ],
+      },
+      options: {
+        ...durationBucketBase,
+        scales: {
+          ...durationBucketBase.scales,
+          x: { ...durationBucketBase.scales.x, stacked: true, ticks: { color: '#6b7a90', font: { family: 'JetBrains Mono', size: 9 } } },
+          y: { ...durationBucketBase.scales.y, stacked: true },
+        },
+      },
+    };
+
+    // ═══ NEW CHART 5: RTF Histogram ═══
+    const rtfValues = okRuns.map((r) => r.metrics?.rtf).filter(Number.isFinite);
+    const rtfRange = rtfValues.length ? Math.max(...rtfValues) - Math.min(...rtfValues) : 0;
+    const rtfBinWidth = rtfRange > 200 ? 20 : rtfRange > 100 ? 10 : 5;
+    const rtfHist = histogram(rtfValues, rtfBinWidth);
+    const rtfHistBase = chartBase('Count');
+    const rtfHistogram = {
+      type: 'bar',
+      data: {
+        labels: rtfHist.labels,
+        datasets: [{ label: 'RTF distribution', data: rtfHist.counts, backgroundColor: 'rgba(124, 166, 220, 0.72)', borderRadius: 2 }],
+      },
+      options: {
+        ...rtfHistBase,
+        scales: {
+          ...rtfHistBase.scales,
+          x: { ...rtfHistBase.scales.x, title: { display: true, text: 'RTF (realtime factor)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } }, ticks: { color: '#6b7a90', maxRotation: 45, font: { family: 'JetBrains Mono', size: 8 } } },
+        },
+        plugins: { ...rtfHistBase.plugins, legend: { display: false } },
+      },
+    };
+
+    // ═══ NEW CHART 6: Similarity Distribution ═══
+    const simPoints = okRuns
+      .filter((r) => Number.isFinite(r.audioDurationSec) && Number.isFinite(r.similarityToFirst))
+      .map((r) => ({
+        x: r.audioDurationSec,
+        y: r.similarityToFirst,
+        sampleKey: r.sampleKey,
+        exact: r.exactMatchToFirst,
+      }));
+    const simBase = chartBase('Similarity');
+    const simDistribution = {
+      type: 'scatter',
+      data: {
+        datasets: [
+          { label: 'Exact match', backgroundColor: 'rgba(93, 186, 130, 0.8)', pointRadius: 5, data: simPoints.filter((p) => p.exact === true) },
+          { label: 'Partial match', backgroundColor: 'rgba(224, 169, 78, 0.8)', pointRadius: 5, data: simPoints.filter((p) => p.exact === false && p.y >= 0.9) },
+          { label: 'Low similarity', backgroundColor: 'rgba(224, 107, 127, 0.8)', pointRadius: 5, data: simPoints.filter((p) => p.exact === false && p.y < 0.9) },
+        ],
+      },
+      options: {
+        ...simBase,
+        scales: {
+          ...simBase.scales,
+          x: { ...simBase.scales.x, title: { display: true, text: 'Audio duration (s)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } },
+          y: { ...simBase.scales.y, min: 0, max: 1.05, title: { display: true, text: 'Similarity to first', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } },
+        },
+        plugins: {
+          ...simBase.plugins,
+          tooltip: { ...simBase.plugins.tooltip, callbacks: { label: (ctx) => { const p = ctx.raw; return `${p.sampleKey}: sim=${(p.y * 100).toFixed(1)}% dur=${p.x.toFixed(2)}s`; } } },
+        },
+      },
+    };
+
+    // ═══ NEW CHART 7: Encode/Total Ratio vs Duration ═══
+    const ratioPoints = okRuns
+      .filter((r) => Number.isFinite(r.audioDurationSec) && Number.isFinite(r.metrics?.encode_ms) && Number.isFinite(r.metrics?.total_ms) && r.metrics.total_ms > 0)
+      .map((r) => ({ x: r.audioDurationSec, encRatio: r.metrics.encode_ms / r.metrics.total_ms, decRatio: r.metrics.decode_ms / r.metrics.total_ms, sampleKey: r.sampleKey }));
+    const ratioBase = chartBase('Fraction of total');
+    const encodeRatio = {
+      type: 'scatter',
+      data: {
+        datasets: [
+          { label: 'Encode / Total', backgroundColor: 'rgba(124, 166, 220, 0.72)', pointRadius: 4, data: ratioPoints.map((p) => ({ x: p.x, y: p.encRatio })) },
+          { label: 'Decode / Total', backgroundColor: 'rgba(121, 194, 159, 0.72)', pointRadius: 4, data: ratioPoints.map((p) => ({ x: p.x, y: p.decRatio })) },
+        ],
+      },
+      options: {
+        ...ratioBase,
+        scales: {
+          ...ratioBase.scales,
+          x: { ...ratioBase.scales.x, title: { display: true, text: 'Audio duration (s)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } },
+          y: { ...ratioBase.scales.y, min: 0, max: 1, title: { display: true, text: 'Fraction of total time', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } },
+        },
+      },
+    };
+
+    // ═══ NEW CHART 8: Throughput Over Time ═══
+    const timePoints = okRuns
+      .filter((r) => r.startedAt && Number.isFinite(r.metrics?.total_ms))
+      .map((r) => ({ x: new Date(r.startedAt).getTime(), y: r.metrics.total_ms, sampleKey: r.sampleKey }))
+      .sort((a, b) => a.x - b.x);
+    const t0 = timePoints.length ? timePoints[0].x : 0;
+    const timeRelative = timePoints.map((p) => ({ x: ((p.x - t0) / 1000).toFixed(1), y: p.y, sampleKey: p.sampleKey }));
+    const throughputBase = chartBase('Total (ms)');
+    const throughput = {
+      type: 'line',
+      data: {
+        labels: timeRelative.map((p) => `${p.x}s`),
+        datasets: [{
+          label: 'Total ms over time',
+          borderColor: 'rgba(154, 170, 209, 0.9)',
+          backgroundColor: 'rgba(154, 170, 209, 0.15)',
+          tension: 0.3,
+          pointRadius: 2,
+          fill: true,
+          data: timeRelative.map((p) => p.y),
+        }],
+      },
+      options: {
+        ...throughputBase,
+        scales: {
+          ...throughputBase.scales,
+          x: { ...throughputBase.scales.x, title: { display: true, text: 'Elapsed (s)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } }, ticks: { color: '#6b7a90', maxTicksLimit: 12, font: { family: 'JetBrains Mono', size: 8 } } },
+        },
+      },
+    };
+
+    // ═══ NEW CHART 9: Per-Sample Variance ═══
+    const sampleGroups = {};
+    okRuns.forEach((r) => {
+      if (!Number.isFinite(r.metrics?.decode_ms)) return;
+      if (!sampleGroups[r.sampleKey]) sampleGroups[r.sampleKey] = [];
+      sampleGroups[r.sampleKey].push(r.metrics.decode_ms);
+    });
+    const sampleVariance = Object.entries(sampleGroups)
+      .filter(([, vals]) => vals.length >= 2)
+      .map(([key, vals]) => ({ key, std: stddev(vals), range: Math.max(...vals) - Math.min(...vals), count: vals.length }))
+      .sort((a, b) => b.std - a.std)
+      .slice(0, 25);
+    const sampleVarBase = chartBase('Decode σ (ms)');
+    const sampleVar = {
+      type: 'bar',
+      data: {
+        labels: sampleVariance.map((s) => s.key),
+        datasets: [{ label: 'Decode std', data: sampleVariance.map((s) => s.std), backgroundColor: 'rgba(224, 107, 127, 0.72)', borderRadius: 2 }],
+      },
+      options: {
+        ...sampleVarBase,
+        indexAxis: 'y',
+        scales: {
+          x: { ...sampleVarBase.scales.x, title: { display: true, text: 'Std deviation (ms)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } } },
+          y: { ...sampleVarBase.scales.y, title: { display: false }, ticks: { color: '#6b7a90', font: { family: 'JetBrains Mono', size: 9 } } },
+        },
+        plugins: {
+          ...sampleVarBase.plugins,
+          legend: { display: false },
+          tooltip: { ...sampleVarBase.plugins.tooltip, callbacks: { label: (ctx) => { const s = sampleVariance[ctx.dataIndex]; return `${s.key}: σ=${s.std.toFixed(1)} range=${s.range.toFixed(1)} (${s.count} runs)`; } } },
+        },
+      },
+    };
+
+    // ═══ NEW CHART 10: Stacked Area — Phase Timeline ═══
+    const areaRuns = okRuns.filter((r) => Number.isFinite(r.metrics?.preprocess_ms) && Number.isFinite(r.metrics?.encode_ms) && Number.isFinite(r.metrics?.decode_ms));
+    const areaLabels = areaRuns.map((_, i) => `#${i + 1}`);
+    const stackedAreaBase = chartBase('Time (ms)');
+    const stackedArea = {
+      type: 'line',
+      data: {
+        labels: areaLabels,
+        datasets: [
+          { label: 'Preprocess', data: areaRuns.map((r) => r.metrics.preprocess_ms), borderColor: 'rgba(217, 179, 122, 0.9)', backgroundColor: 'rgba(217, 179, 122, 0.3)', fill: true, tension: 0.3, pointRadius: 0 },
+          { label: 'Encode', data: areaRuns.map((r) => r.metrics.encode_ms), borderColor: 'rgba(124, 166, 220, 0.9)', backgroundColor: 'rgba(124, 166, 220, 0.3)', fill: true, tension: 0.3, pointRadius: 0 },
+          { label: 'Decode', data: areaRuns.map((r) => r.metrics.decode_ms), borderColor: 'rgba(121, 194, 159, 0.9)', backgroundColor: 'rgba(121, 194, 159, 0.3)', fill: true, tension: 0.3, pointRadius: 0 },
+        ],
+      },
+      options: {
+        ...stackedAreaBase,
+        scales: {
+          ...stackedAreaBase.scales,
+          x: { ...stackedAreaBase.scales.x, title: { display: true, text: 'Run index', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } }, ticks: { maxTicksLimit: 15, color: '#6b7a90', font: { family: 'JetBrains Mono', size: 8 } } },
+          y: { ...stackedAreaBase.scales.y, stacked: true },
+        },
+      },
+    };
+
+    return { encDec, rtfxRunOrder, rtfxDuration, durPre, trend, bottleneck, compareStages, durTotal, txDecode, phaseBox, durationBucket, rtfHistogram, simDistribution, encodeRatio, throughput, sampleVar, stackedArea };
   }, [okRuns, configStats]);
 
   const recentRuns = useMemo(() => [...runs].reverse().slice(0, 50), [runs]);
@@ -1834,7 +2140,7 @@ export default function App() {
         {[
           { id: 'benchmark', label: '⚙ Benchmark' },
           { id: 'overview', label: 'Overview' },
-          { id: 'charts', label: 'Charts', count: chartConfigs ? 7 : 0 },
+          { id: 'charts', label: 'Charts', count: chartConfigs ? 17 : 0 },
           { id: 'compare', label: 'Compare', count: snapshots.length },
           { id: 'data', label: 'Data', count: runs.length },
         ].map((t) => (
@@ -2033,15 +2339,36 @@ export default function App() {
         {activeTab === 'charts' && (
           <div className="fade-in">
             {chartConfigs ? (
-              <div className="chart-grid">
-                <ChartCard title="Encoder vs Decoder" badge="scatter" config={chartConfigs.encDec} />
-                <ChartCard title="Run Order vs RTFx" badge="scatter" config={chartConfigs.rtfxRunOrder} />
-                <ChartCard title="Duration vs RTFx" badge="scatter" config={chartConfigs.rtfxDuration} />
-                <ChartCard title="Duration vs Preprocess" badge="scatter" config={chartConfigs.durPre} />
-                <ChartCard title="Repeat Trend" badge="line" config={chartConfigs.trend} />
-                <ChartCard title="Stage Bottleneck" badge="doughnut" config={chartConfigs.bottleneck} />
-                <ChartCard title="Config Compare" badge="stacked" config={chartConfigs.compareStages} />
-              </div>
+              <>
+                <h3 className="section-title">Timing & Scaling</h3>
+                <div className="chart-grid">
+                  <ChartCard title="Encoder vs Decoder" badge="scatter" config={chartConfigs.encDec} />
+                  <ChartCard title="Duration vs Total + Fit" badge="regression" config={chartConfigs.durTotal} />
+                  <ChartCard title="Duration vs Preprocess" badge="scatter" config={chartConfigs.durPre} />
+                  <ChartCard title="Transcript Length vs Decode" badge="scatter" config={chartConfigs.txDecode} />
+                  <ChartCard title="Phase Timing Ranges" badge="box" config={chartConfigs.phaseBox} />
+                  <ChartCard title="Duration Bucket Breakdown" badge="stacked" config={chartConfigs.durationBucket} />
+                </div>
+
+                <h3 className="section-title" style={{ marginTop: 20 }}>Performance & RTF</h3>
+                <div className="chart-grid">
+                  <ChartCard title="Run Order vs RTFx" badge="scatter" config={chartConfigs.rtfxRunOrder} />
+                  <ChartCard title="Duration vs RTFx" badge="scatter" config={chartConfigs.rtfxDuration} />
+                  <ChartCard title="RTF Distribution" badge="histogram" config={chartConfigs.rtfHistogram} />
+                  <ChartCard title="Encode/Decode Ratio" badge="scatter" config={chartConfigs.encodeRatio} />
+                  <ChartCard title="Stage Bottleneck" badge="doughnut" config={chartConfigs.bottleneck} />
+                  <ChartCard title="Config Compare" badge="stacked" config={chartConfigs.compareStages} />
+                </div>
+
+                <h3 className="section-title" style={{ marginTop: 20 }}>Stability & Consistency</h3>
+                <div className="chart-grid">
+                  <ChartCard title="Repeat Trend" badge="line" config={chartConfigs.trend} />
+                  <ChartCard title="Throughput Over Time" badge="line" config={chartConfigs.throughput} />
+                  <ChartCard title="Similarity Distribution" badge="scatter" config={chartConfigs.simDistribution} />
+                  <ChartCard title="Per-Sample Variance" badge="bar" config={chartConfigs.sampleVar} />
+                  <ChartCard title="Phase Timeline" badge="area" config={chartConfigs.stackedArea} />
+                </div>
+              </>
             ) : (
               <div className="empty-state"><p>Run a benchmark batch to generate charts.</p></div>
             )}
