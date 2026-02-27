@@ -20,6 +20,11 @@ import {
   textSimilarity,
   toCsv,
 } from './utils/benchmarkStats';
+import {
+  fetchModelFiles,
+  getAvailableQuantModes,
+  pickPreferredQuant,
+} from './utils/modelSelection';
 import './App.css';
 
 const SETTINGS_KEY = 'parakeet.benchmark.settings.v1';
@@ -38,127 +43,10 @@ const BACKENDS = ['webgpu-hybrid', 'webgpu', 'wasm'];
 const QUANTS = ['fp32', 'int8', 'fp16'];
 const PREPROCESSOR_MODEL = 'nemo128';
 const WARMUP_AUDIO_FALLBACK_URL = 'https://raw.githubusercontent.com/ysdede/parakeet.js/master/examples/demo/public/assets/life_Jim.wav';
-const QUANTIZATION_ORDER = ['fp16', 'int8', 'fp32'];
-const MODEL_FILES_CACHE = new Map();
-const MODEL_REVISIONS_CACHE = new Map();
-
-function formatRepoPath(repoId) {
-  return String(repoId || '')
-    .split('/')
-    .map((part) => encodeURIComponent(part))
-    .join('/');
-}
-
-function normalizeRepoPath(path) {
-  return String(path || '').replace(/^\.\/+/, '').replace(/\\/g, '/');
-}
-
-function parseModelFiles(payload) {
-  if (Array.isArray(payload)) {
-    return payload
-      .filter((entry) => entry?.type === 'file' && typeof entry?.path === 'string')
-      .map((entry) => normalizeRepoPath(entry.path));
-  }
-
-  if (payload && typeof payload === 'object' && Array.isArray(payload.siblings)) {
-    return payload.siblings
-      .map((entry) => normalizeRepoPath(entry?.rfilename))
-      .filter(Boolean);
-  }
-
-  return [];
-}
-
-function hasModelFile(files, filename) {
-  const target = normalizeRepoPath(filename);
-  return files.some((path) => path === target || path.endsWith(`/${target}`));
-}
-
-async function fetchModelFiles(repoId, revision = 'main') {
-  if (!repoId) return [];
-  const cacheKey = `${repoId}@${revision}`;
-  if (MODEL_FILES_CACHE.has(cacheKey)) return MODEL_FILES_CACHE.get(cacheKey);
-
-  const repoPath = formatRepoPath(repoId);
-  const encodedRevision = encodeURIComponent(revision);
-  const treeUrl = `https://huggingface.co/api/models/${repoPath}/tree/${encodedRevision}?recursive=1`;
-  const metadataUrl = `https://huggingface.co/api/models/${repoPath}?revision=${encodedRevision}`;
-
-  try {
-    const response = await fetch(treeUrl);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const files = parseModelFiles(await response.json());
-    MODEL_FILES_CACHE.set(cacheKey, files);
-    return files;
-  } catch (treeError) {
-    console.warn(`[modelSelection] Tree listing failed for ${repoId}@${revision}; trying metadata`, treeError);
-  }
-
-  try {
-    const response = await fetch(metadataUrl);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const files = parseModelFiles(await response.json());
-    MODEL_FILES_CACHE.set(cacheKey, files);
-    return files;
-  } catch (metadataError) {
-    console.warn(`[modelSelection] Metadata listing failed for ${repoId}@${revision}`, metadataError);
-    return [];
-  }
-}
-
-async function fetchModelRevisions(repoId) {
-  if (!repoId) return ['main'];
-  if (MODEL_REVISIONS_CACHE.has(repoId)) return MODEL_REVISIONS_CACHE.get(repoId);
-
-  try {
-    const repoPath = formatRepoPath(repoId);
-    const response = await fetch(`https://huggingface.co/api/models/${repoPath}/refs`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = await response.json();
-    const branches = Array.isArray(payload?.branches)
-      ? payload.branches.map((branch) => String(branch?.name || '')).filter(Boolean)
-      : [];
-    const revisions = branches.length ? branches : ['main'];
-    MODEL_REVISIONS_CACHE.set(repoId, revisions);
-    return revisions;
-  } catch (error) {
-    console.warn(`[modelSelection] Failed to fetch revisions for ${repoId}; using main`, error);
-    return ['main'];
-  }
-}
-
-function getQuantFlags(files, baseName) {
-  return {
-    fp16: hasModelFile(files, `${baseName}.fp16.onnx`),
-    int8: hasModelFile(files, `${baseName}.int8.onnx`),
-    fp32: hasModelFile(files, `${baseName}.onnx`),
-  };
-}
-
-function quantFlagsToOptions(flags) {
-  const options = QUANTIZATION_ORDER.filter((quant) => Boolean(flags?.[quant]));
-  return options.length ? options : ['fp32'];
-}
-
-function pickPreferredQuant(available, currentBackend, component = 'encoder') {
-  let preferred;
-  if (component === 'decoder') {
-    preferred = ['int8', 'fp32', 'fp16'];
-  } else {
-    preferred = String(currentBackend || '').startsWith('webgpu')
-      ? ['fp16', 'fp32', 'int8']
-      : ['int8', 'fp32', 'fp16'];
-  }
-  return preferred.find((quant) => available.includes(quant)) || available[0] || 'fp32';
-}
-
-function revokeBlobUrls(urls) {
-  for (const value of Object.values(urls || {})) {
-    if (typeof value === 'string' && value.startsWith('blob:')) {
-      URL.revokeObjectURL(value);
-    }
-  }
-}
+const FP16_REVISION_BY_MODEL = {
+  'parakeet-tdt-0.6b-v2': 'feat/fp16-canonical-v2',
+  'parakeet-tdt-0.6b-v3': 'feat/fp16-canonical-v3',
+};
 
 function clamp(value, fallback, min, max) {
   const num = Number(value);
@@ -185,6 +73,10 @@ function calcRtfx(audioDurationSec, stageMs) {
     return null;
   }
   return (duration * 1000) / latencyMs;
+}
+
+function getFp16Revision(modelKey) {
+  return FP16_REVISION_BY_MODEL[modelKey] || 'main';
 }
 
 function deltaPercent(base, next, lowerIsBetter = true) {
@@ -682,43 +574,15 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const repoId = MODELS[modelKey]?.repoId || modelKey;
+    const revision = getFp16Revision(modelKey);
 
     (async () => {
-      const mainFiles = await fetchModelFiles(repoId, 'main');
+      const files = await fetchModelFiles(repoId, revision);
       if (cancelled) return;
 
-      const encoderFlags = getQuantFlags(mainFiles, 'encoder-model');
-      const decoderFlags = getQuantFlags(mainFiles, 'decoder_joint-model');
+      const encOptions = getAvailableQuantModes(files, 'encoder-model');
+      const decOptions = getAvailableQuantModes(files, 'decoder_joint-model');
 
-      // FP16 weights can live on non-main branches for some repos.
-      const needsBranchScan = !encoderFlags.fp16 || !decoderFlags.fp16;
-      if (needsBranchScan) {
-        const revisions = await fetchModelRevisions(repoId);
-        for (const revision of revisions) {
-          if (cancelled) return;
-          if (!revision || revision === 'main') continue;
-
-          const files = await fetchModelFiles(repoId, revision);
-          const enc = getQuantFlags(files, 'encoder-model');
-          const dec = getQuantFlags(files, 'decoder_joint-model');
-          encoderFlags.fp16 = encoderFlags.fp16 || enc.fp16;
-          encoderFlags.int8 = encoderFlags.int8 || enc.int8;
-          encoderFlags.fp32 = encoderFlags.fp32 || enc.fp32;
-          decoderFlags.fp16 = decoderFlags.fp16 || dec.fp16;
-          decoderFlags.int8 = decoderFlags.int8 || dec.int8;
-          decoderFlags.fp32 = decoderFlags.fp32 || dec.fp32;
-
-          if (
-            encoderFlags.fp16 && encoderFlags.int8 && encoderFlags.fp32 &&
-            decoderFlags.fp16 && decoderFlags.int8 && decoderFlags.fp32
-          ) {
-            break;
-          }
-        }
-      }
-
-      const encOptions = quantFlagsToOptions(encoderFlags);
-      const decOptions = quantFlagsToOptions(decoderFlags);
       setEncoderQuantOptions(encOptions);
       setDecoderQuantOptions(decOptions);
     })();
@@ -947,6 +811,7 @@ export default function App() {
         backend,
         encoderQuant,
         decoderQuant,
+        revision: getFp16Revision(modelKey),
         preprocessor: PREPROCESSOR_MODEL,
         preprocessorBackend,
         cpuThreads,
@@ -960,88 +825,27 @@ export default function App() {
         },
       };
 
-      const compileFromHub = async (hubResult, requestedEncoderQuant, requestedDecoderQuant) => (
-        ParakeetModel.fromUrls({
-          ...hubResult.urls,
-          filenames: hubResult.filenames,
-          preprocessorBackend: hubResult.preprocessorBackend,
-          backend,
-          encoderQuant: requestedEncoderQuant,
-          decoderQuant: requestedDecoderQuant,
-          cpuThreads,
-          verbose: false,
-        })
-      );
-
-      let hub;
-      let effectiveEncoderQuant = encoderQuant;
-      let effectiveDecoderQuant = decoderQuant;
-      const loadNotes = [];
-
-      try {
-        hub = await getParakeetModel(modelKey, baseOptions);
-      } catch (firstDownloadError) {
-        const selectedFp16 = encoderQuant === 'fp16' || decoderQuant === 'fp16';
-        if (!selectedFp16) throw firstDownloadError;
-
-        effectiveEncoderQuant = encoderQuant === 'fp16' ? 'fp32' : encoderQuant;
-        effectiveDecoderQuant = decoderQuant === 'fp16' ? 'fp32' : decoderQuant;
-        setModelProgress('FP16 assets unavailable, retrying with fp32...');
-        hub = await getParakeetModel(modelKey, {
-          ...baseOptions,
-          encoderQuant: effectiveEncoderQuant,
-          decoderQuant: effectiveDecoderQuant,
-        });
-        loadNotes.push('fp16 assets unavailable, retried with fp32');
-      }
-
-      try {
-        modelRef.current = await compileFromHub(hub, effectiveEncoderQuant, effectiveDecoderQuant);
-      } catch (firstCompileError) {
-        const canRetry = hub?.quantisation?.encoder === 'fp16' || hub?.quantisation?.decoder === 'fp16';
-        if (!canRetry) throw firstCompileError;
-
-        revokeBlobUrls(hub?.urls);
-        effectiveEncoderQuant = hub?.quantisation?.encoder === 'fp16' ? 'fp32' : effectiveEncoderQuant;
-        effectiveDecoderQuant = hub?.quantisation?.decoder === 'fp16' ? 'fp32' : effectiveDecoderQuant;
-        setModelProgress('FP16 compile failed, retrying with fp32...');
-
-        let retryHub;
-        try {
-          retryHub = await getParakeetModel(modelKey, {
-            ...baseOptions,
-            encoderQuant: effectiveEncoderQuant,
-            decoderQuant: effectiveDecoderQuant,
-          });
-        } catch (retryDownloadError) {
-          throw new Error(
-            `Initial compile failed (${firstCompileError?.message || firstCompileError}). ` +
-            `FP32 retry download failed (${retryDownloadError?.message || retryDownloadError}).`
-          );
-        }
-
-        try {
-          modelRef.current = await compileFromHub(retryHub, effectiveEncoderQuant, effectiveDecoderQuant);
-        } catch (retryCompileError) {
-          throw new Error(
-            `Initial compile failed (${firstCompileError?.message || firstCompileError}). ` +
-            `FP32 retry compile failed (${retryCompileError?.message || retryCompileError}).`
-          );
-        }
-        hub = retryHub;
-        loadNotes.push(`fp16 compile retry -> e:${effectiveEncoderQuant} d:${effectiveDecoderQuant}`);
-      }
+      const hub = await getParakeetModel(modelKey, baseOptions);
+      modelRef.current = await ParakeetModel.fromUrls({
+        ...hub.urls,
+        filenames: hub.filenames,
+        preprocessorBackend: hub.preprocessorBackend,
+        backend,
+        cpuThreads,
+        verbose: false,
+      });
 
       const resolvedQuant = hub?.quantisation
         ? `resolved e:${hub.quantisation.encoder} d:${hub.quantisation.decoder}`
         : '';
+      const resolvedRevision = baseOptions.revision ? `revision:${baseOptions.revision}` : '';
       const loadedFiles = hub?.filenames
         ? `${hub.filenames.encoder}, ${hub.filenames.decoder}`
         : '';
       const backendHint = backend.startsWith('webgpu')
         ? 'decoder executes on WASM in webgpu modes'
         : '';
-      setResolvedModelInfo([resolvedQuant, loadedFiles, backendHint, ...loadNotes].filter(Boolean).join(' | '));
+      setResolvedModelInfo([resolvedQuant, resolvedRevision, loadedFiles, backendHint].filter(Boolean).join(' | '));
 
       setModelStatus('Verifying model...');
       setModelProgress('Running reference transcription');
