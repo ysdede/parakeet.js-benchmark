@@ -5,8 +5,6 @@ import {
   fetchDatasetInfo,
   fetchDatasetRows,
   fetchDatasetSplits,
-  fetchRandomRows,
-  fetchSequentialRows,
   getConfigsAndSplits,
   normalizeDatasetRow,
 } from './utils/hfDataset';
@@ -31,7 +29,10 @@ const SETTINGS_KEY = 'parakeet.benchmark.settings.v1';
 const SNAPSHOTS_KEY = 'parakeet.benchmark.snapshots.v1';
 const DATASET_SPLITS_CACHE_PREFIX = 'parakeet.dataset.splits.v1:';
 const DATASET_INFO_CACHE_PREFIX = 'parakeet.dataset.info.v1:';
+const DATASET_ROWS_CACHE_PREFIX = 'parakeet.dataset.rows.v1:';
 const DATASET_META_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const DATASET_ROWS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_SAMPLE_COUNT = 10000;
 const MAX_SNAPSHOTS = 20;
 
 const MODEL_OPTIONS = Object.entries(MODELS).map(([key, config]) => ({
@@ -47,6 +48,12 @@ const FP16_REVISION_BY_MODEL = {
   'parakeet-tdt-0.6b-v2': 'feat/fp16-canonical-v2',
   'parakeet-tdt-0.6b-v3': 'feat/fp16-canonical-v3',
 };
+const SNAPSHOT_PARAM_OPTIONS = [
+  { key: 'total', label: 'Total', summaryKey: 'totalMean', runField: 'total_ms', color: 'rgba(154, 170, 209, 0.85)' },
+  { key: 'preprocess', label: 'Preprocess', summaryKey: 'preprocessMean', runField: 'preprocess_ms', color: 'rgba(217, 179, 122, 0.85)' },
+  { key: 'encode', label: 'Encode', summaryKey: 'encodeMean', runField: 'encode_ms', color: 'rgba(124, 166, 220, 0.85)' },
+  { key: 'decode', label: 'Decode', summaryKey: 'decodeMean', runField: 'decode_ms', color: 'rgba(121, 194, 159, 0.85)' },
+];
 
 function clamp(value, fallback, min, max) {
   const num = Number(value);
@@ -155,6 +162,21 @@ async function putCachedAudioBlob(cacheKey, blob) {
   }
 }
 
+async function clearCachedAudioBlobs() {
+  try {
+    const db = await openAudioCacheDb();
+    await new Promise((resolve) => {
+      const tx = db.transaction(AUDIO_CACHE_STORE, 'readwrite');
+      const store = tx.objectStore(AUDIO_CACHE_STORE);
+      store.clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // Ignore IndexedDB cache clear failures.
+  }
+}
+
 function chartBase(yLabel) {
   return {
     responsive: true,
@@ -162,32 +184,38 @@ function chartBase(yLabel) {
     interaction: { mode: 'nearest', intersect: false },
     plugins: {
       legend: {
+        position: 'top',
         labels: {
-          color: '#dce9fb',
-          font: { family: 'IBM Plex Sans', size: 11 },
+          color: '#b0bdd0',
+          font: { family: 'Inter', size: 10 },
+          boxWidth: 8,
+          padding: 10,
         },
       },
       tooltip: {
-        backgroundColor: '#0f1a2d',
-        borderColor: '#4f74ac',
+        backgroundColor: '#181c28',
+        titleColor: '#eaf0f9',
+        bodyColor: '#b0bdd0',
+        borderColor: 'rgba(255,255,255,0.08)',
         borderWidth: 1,
-        titleColor: '#f4f9ff',
-        bodyColor: '#e4eeff',
+        padding: 8,
+        bodyFont: { family: 'JetBrains Mono', size: 10 },
+        titleFont: { family: 'Inter', size: 11 },
       },
     },
     scales: {
       x: {
-        grid: { color: 'rgba(255,255,255,0.05)' },
-        ticks: { color: '#c6d5ed', font: { family: 'IBM Plex Mono', size: 10 } },
+        grid: { color: 'rgba(255,255,255,0.03)' },
+        ticks: { color: '#6b7a90', font: { family: 'JetBrains Mono', size: 10 } },
       },
       y: {
-        grid: { color: 'rgba(255,255,255,0.05)' },
-        ticks: { color: '#c6d5ed', font: { family: 'IBM Plex Mono', size: 10 } },
+        grid: { color: 'rgba(255,255,255,0.03)' },
+        ticks: { color: '#6b7a90', font: { family: 'JetBrains Mono', size: 10 } },
         title: {
           display: true,
           text: yLabel,
-          color: '#deebff',
-          font: { family: 'IBM Plex Sans', size: 11, weight: '600' },
+          color: '#b0bdd0',
+          font: { family: 'Inter', size: 11, weight: '600' },
         },
       },
     },
@@ -236,6 +264,39 @@ function toCacheKey(prefix, ...parts) {
   return `${prefix}${parts.map((part) => encodeURIComponent(String(part))).join('::')}`;
 }
 
+function normalizeSeedText(seed) {
+  if (seed === undefined || seed === null || seed === '') return null;
+  return String(seed);
+}
+
+function createSeededRng(seedText) {
+  if (!seedText) return Math.random;
+  let h = 2166136261;
+  for (let i = 0; i < seedText.length; i += 1) {
+    h ^= seedText.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  let t = h >>> 0;
+  return function next() {
+    t += 0x6D2B79F5;
+    let x = Math.imul(t ^ (t >>> 15), t | 1);
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pickUniqueRandomIndices(total, count, seedText) {
+  const maxTotal = Math.max(0, Number(total) || 0);
+  const wanted = Math.max(0, Math.min(maxTotal, Number(count) || 0));
+  if (!wanted) return [];
+  const rng = createSeededRng(seedText);
+  const picked = new Set();
+  while (picked.size < wanted) {
+    picked.add(Math.floor(rng() * maxTotal));
+  }
+  return Array.from(picked);
+}
+
 function readCacheEntry(key) {
   try {
     const parsed = JSON.parse(localStorage.getItem(key) || 'null');
@@ -255,6 +316,20 @@ function writeCacheEntry(key, data) {
     }));
   } catch {
     // Ignore storage quota / serialization errors.
+  }
+}
+
+function clearLocalStorageByPrefix(prefix) {
+  try {
+    const toDelete = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) toDelete.push(key);
+    }
+    toDelete.forEach((key) => localStorage.removeItem(key));
+    return toDelete.length;
+  } catch {
+    return 0;
   }
 }
 
@@ -426,9 +501,9 @@ async function collectHardwareProfile() {
       const ext = gl.getExtension('WEBGL_debug_renderer_info');
       profile.webgl = ext
         ? {
-            vendor: gl.getParameter(ext.UNMASKED_VENDOR_WEBGL),
-            renderer: gl.getParameter(ext.UNMASKED_RENDERER_WEBGL),
-          }
+          vendor: gl.getParameter(ext.UNMASKED_VENDOR_WEBGL),
+          renderer: gl.getParameter(ext.UNMASKED_RENDERER_WEBGL),
+        }
         : { available: true, debugRendererInfo: false };
     }
   } catch (error) {
@@ -452,7 +527,7 @@ export default function App() {
   const [datasetConfig, setDatasetConfig] = useState(saved.datasetConfig || 'default');
   const [datasetSplit, setDatasetSplit] = useState(saved.datasetSplit || 'train');
   const [offset, setOffset] = useState(clamp(saved.offset, 0, 0, 1_000_000));
-  const [sampleCount, setSampleCount] = useState(clamp(saved.sampleCount, 6, 1, 100));
+  const [sampleCount, setSampleCount] = useState(clamp(saved.sampleCount, 6, 1, MAX_SAMPLE_COUNT));
   const [repeatCount, setRepeatCount] = useState(clamp(saved.repeatCount, 5, 1, 100));
   const [warmups, setWarmups] = useState(clamp(saved.warmups, 1, 0, 10));
   const [randomize, setRandomize] = useState(saved.randomize !== false);
@@ -481,9 +556,13 @@ export default function App() {
   const [snapshots, setSnapshots] = useState(loadSnapshots());
   const [compareAId, setCompareAId] = useState('');
   const [compareBId, setCompareBId] = useState('');
+  const [selectedSnapshotIds, setSelectedSnapshotIds] = useState([]);
+  const [selectedCompareParams, setSelectedCompareParams] = useState(['decode']);
   const [showPreparedSamples, setShowPreparedSamples] = useState(false);
+  const [activeTab, setActiveTab] = useState('benchmark');
+  const [theme, setTheme] = useState(() => localStorage.getItem('parakeet-theme') || 'dark');
   const [hardwareProfile, setHardwareProfile] = useState(null);
-  const [hardwareStatus, setHardwareStatus] = useState('Not collected');
+  const [hardwareStatus, setHardwareStatus] = useState('');
   const [isLoadingHardware, setIsLoadingHardware] = useState(false);
   const [encoderQuantOptions, setEncoderQuantOptions] = useState(QUANTS);
   const [decoderQuantOptions, setDecoderQuantOptions] = useState(QUANTS);
@@ -493,9 +572,17 @@ export default function App() {
   const stopRef = useRef(false);
   const audioCacheRef = useRef(new Map());
 
+  // Theme
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('parakeet-theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+
   async function releaseModelResources(model) {
     if (!model) return;
-    try { model.stopProfiling?.(); } catch {}
+    try { model.stopProfiling?.(); } catch { }
     const releasables = [
       model.encoderSession,
       model.joinerSession,
@@ -509,16 +596,16 @@ export default function App() {
         } else if (typeof session.dispose === 'function') {
           session.dispose();
         }
-      } catch {}
+      } catch { }
     }));
   }
 
   function queueModelRelease(model) {
     if (!model) return releaseQueueRef.current;
     const releaseTask = releaseQueueRef.current
-      .catch(() => {})
+      .catch(() => { })
       .then(() => releaseModelResources(model));
-    releaseQueueRef.current = releaseTask.catch(() => {});
+    releaseQueueRef.current = releaseTask.catch(() => { });
     return releaseTask;
   }
 
@@ -606,6 +693,10 @@ export default function App() {
     if (!compareBId) setCompareBId(snapshots[1]?.id || snapshots[0].id);
   }, [snapshots, compareAId, compareBId]);
 
+  useEffect(() => {
+    setSelectedSnapshotIds((prev) => prev.filter((id) => snapshots.some((s) => s.id === id)));
+  }, [snapshots]);
+
   async function refreshDatasetMeta(nextDataset = datasetId, nextConfig = datasetConfig, nextSplit = datasetSplit, forceRefresh = false) {
     setIsLoadingDataset(true);
     setDatasetStatus('Loading dataset metadata...');
@@ -659,9 +750,8 @@ export default function App() {
     setHardwareStatus('Reading browser hardware profile...');
     try {
       const profile = await collectHardwareProfile();
-      const summary = summarizeHardwareProfile(profile);
       setHardwareProfile(profile);
-      setHardwareStatus(`CPU ${summary.cpuLabel}, GPU ${summary.gpuLabel}`);
+      setHardwareStatus('Ready');
     } catch (error) {
       console.error(error);
       setHardwareStatus(`Hardware probe failed: ${error.message}`);
@@ -676,36 +766,74 @@ export default function App() {
   }, []);
 
   async function prepareSampleRows() {
-    const requested = clamp(sampleCount, 6, 1, 100);
-    setDatasetStatus('Preparing sample rows...');
+    const requested = clamp(sampleCount, 6, 1, MAX_SAMPLE_COUNT);
+    setDatasetStatus('Preparing sample rows (user pipeline simulation)...');
+
+    const fetchDatasetRowsCached = ({ dataset, config, split, offset: rowOffset = 0, length = 100 }) => {
+      const key = toCacheKey(DATASET_ROWS_CACHE_PREFIX, dataset, config, split, rowOffset, length);
+      return readThroughCache({
+        key,
+        ttlMs: DATASET_ROWS_CACHE_TTL_MS,
+        fetcher: () => fetchDatasetRows({
+          dataset,
+          config,
+          split,
+          offset: rowOffset,
+          length,
+        }),
+      });
+    };
 
     let rawRows = [];
     let randomMeta = null;
     if (randomize) {
-      let totalRows = splitCounts?.[datasetSplit]?.num_examples;
-      if (!Number.isFinite(totalRows)) {
-        const probe = await fetchDatasetRows({ dataset: datasetId, config: datasetConfig, split: datasetSplit, offset: 0, length: 1 });
-        totalRows = probe.num_rows_total || 1;
-      }
-      const sampled = await fetchRandomRows({
+      // Match regular demo behavior: fetch one small row pool, then randomly pick from it.
+      const poolLength = Math.max(requested, Math.min(100, requested * 4));
+      const poolResult = await fetchDatasetRowsCached({
         dataset: datasetId,
         config: datasetConfig,
         split: datasetSplit,
-        totalRows,
-        sampleCount: requested,
-        seed: randomSeed,
+        offset,
+        length: poolLength,
       });
-      rawRows = sampled.rows;
-      randomMeta = sampled;
+      const poolRows = poolResult.data?.rows || [];
+      const seedText = normalizeSeedText(randomSeed);
+      const seedMaterial = seedText
+        ? `${seedText}|${datasetId}|${datasetConfig}|${datasetSplit}|${offset}|${requested}`
+        : null;
+      const chosenIndices = pickUniqueRandomIndices(poolRows.length, requested, seedMaterial);
+      rawRows = chosenIndices.map((idx) => poolRows[idx]).filter(Boolean);
+      randomMeta = {
+        requestedCount: requested,
+        poolCount: poolRows.length,
+        fromCache: poolResult.fromCache,
+      };
     } else {
-      const sequential = await fetchSequentialRows({
-        dataset: datasetId,
-        config: datasetConfig,
-        split: datasetSplit,
-        startOffset: offset,
-        limit: requested,
-      });
-      rawRows = sequential.rows;
+      let cursor = Math.max(0, Number(offset) || 0);
+      let rowsFromCache = false;
+
+      while (rawRows.length < requested) {
+        const pageLength = Math.min(100, requested - rawRows.length);
+        const pageResult = await fetchDatasetRowsCached({
+          dataset: datasetId,
+          config: datasetConfig,
+          split: datasetSplit,
+          offset: cursor,
+          length: pageLength,
+        });
+
+        const pageRows = pageResult.data?.rows || [];
+        rowsFromCache = rowsFromCache || !!pageResult.fromCache;
+        if (!pageRows.length) break;
+
+        rawRows.push(...pageRows);
+        cursor += pageRows.length;
+        if (pageRows.length < pageLength) break;
+      }
+
+      randomMeta = {
+        fromCache: rowsFromCache,
+      };
     }
 
     const normalized = rawRows
@@ -718,16 +846,32 @@ export default function App() {
 
     setPreparedSamples(normalized);
     if (randomize) {
-      const failedCount = randomMeta?.failedOffsets?.length || 0;
       const reqCount = randomMeta?.requestedCount || requested;
       const shortfall = reqCount - normalized.length;
+      const poolCount = randomMeta?.poolCount || normalized.length;
       const warning = shortfall > 0 ? `, shortfall ${shortfall}` : '';
-      const failed = failedCount > 0 ? `, skipped ${failedCount} failing rows` : '';
-      setDatasetStatus(`Prepared ${normalized.length}/${reqCount} samples (seed: ${String(randomSeed) || 'random'}${warning}${failed})`);
+      const mode = randomMeta?.fromCache ? 'cache' : 'live';
+      setDatasetStatus(`Prepared ${normalized.length}/${reqCount} samples from ${poolCount} rows (${mode}, seed: ${String(randomSeed) || 'random'}${warning})`);
     } else {
-      setDatasetStatus(`Prepared ${normalized.length} samples`);
+      const mode = randomMeta?.fromCache ? 'cache' : 'live';
+      setDatasetStatus(`Prepared ${normalized.length} samples (${mode})`);
     }
     return normalized;
+  }
+
+  async function clearDatasetCache() {
+    setDatasetStatus('Clearing dataset cache...');
+    try {
+      const removedMeta = clearLocalStorageByPrefix(DATASET_SPLITS_CACHE_PREFIX)
+        + clearLocalStorageByPrefix(DATASET_INFO_CACHE_PREFIX)
+        + clearLocalStorageByPrefix(DATASET_ROWS_CACHE_PREFIX);
+      await clearCachedAudioBlobs();
+      audioCacheRef.current.clear();
+      setPreparedSamples([]);
+      setDatasetStatus(`Dataset cache cleared (removed ${removedMeta} metadata/row entries + audio blobs). Model/ONNX cache untouched.`);
+    } catch (error) {
+      setDatasetStatus(`Failed to clear dataset cache: ${error.message}`);
+    }
   }
 
   async function decodeAudio(url) {
@@ -891,7 +1035,7 @@ export default function App() {
         const sample = samples[s];
         const sampleKey = `${datasetSplit}:${sample.rowIndex}`;
 
-        setProgress({ current: done, total, stage: `Decoding ${sampleKey}` });
+        setProgress({ current: done, total, stage: `Preparing ${sampleKey} (download + decode)` });
 
         let decoded;
         try {
@@ -910,12 +1054,12 @@ export default function App() {
             similarityToFirst: null,
             metrics: null,
             error: `Decode error: ${error.message}`,
-              modelKey,
-              backend,
-              encoderQuant,
-              decoderQuant,
-              preprocessor: PREPROCESSOR_MODEL,
-              preprocessorBackend,
+            modelKey,
+            backend,
+            encoderQuant,
+            decoderQuant,
+            preprocessor: PREPROCESSOR_MODEL,
+            preprocessorBackend,
             hardwareCpu: hardwareSummary.cpuLabel,
             hardwareGpu: hardwareSummary.gpuLabel,
             hardwareGpuModel: hardwareSummary.gpuModelLabel,
@@ -931,7 +1075,7 @@ export default function App() {
 
         for (let w = 0; w < warmups; w += 1) {
           if (stopRef.current) break;
-          setProgress({ current: done, total, stage: `Warmup ${w + 1}/${warmups} for ${sampleKey}` });
+          setProgress({ current: done, total, stage: `Transcribing warmup ${w + 1}/${warmups} for ${sampleKey}` });
           await modelRef.current.transcribe(decoded.pcm, decoded.sampleRate, {
             enableProfiling,
             returnConfidences: false,
@@ -944,7 +1088,7 @@ export default function App() {
           if (stopRef.current) break;
 
           const startedAt = new Date().toISOString();
-          setProgress({ current: done, total, stage: `Run ${r}/${repeatCount} for ${sampleKey}` });
+          setProgress({ current: done, total, stage: `Transcribing run ${r}/${repeatCount} for ${sampleKey}` });
 
           try {
             const result = await modelRef.current.transcribe(decoded.pcm, decoded.sampleRate, {
@@ -1188,7 +1332,7 @@ export default function App() {
           ...encDecBase.scales,
           x: {
             ...encDecBase.scales.x,
-            title: { display: true, text: 'Encode (ms)', color: '#deebff', font: { family: 'IBM Plex Sans', size: 11, weight: '600' } },
+            title: { display: true, text: 'Encode (ms)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } },
           },
         },
       },
@@ -1252,7 +1396,7 @@ export default function App() {
           ...rtfxRunOrderBase.scales,
           x: {
             ...rtfxRunOrderBase.scales.x,
-            title: { display: true, text: 'Run order', color: '#deebff', font: { family: 'IBM Plex Sans', size: 11, weight: '600' } },
+            title: { display: true, text: 'Run order', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } },
           },
         },
       },
@@ -1309,7 +1453,7 @@ export default function App() {
           ...rtfxDurationBase.scales,
           x: {
             ...rtfxDurationBase.scales.x,
-            title: { display: true, text: 'Audio duration (s)', color: '#deebff', font: { family: 'IBM Plex Sans', size: 11, weight: '600' } },
+            title: { display: true, text: 'Audio duration (s)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } },
           },
         },
       },
@@ -1334,7 +1478,7 @@ export default function App() {
           ...durPreBase.scales,
           x: {
             ...durPreBase.scales.x,
-            title: { display: true, text: 'Audio duration (s)', color: '#deebff', font: { family: 'IBM Plex Sans', size: 11, weight: '600' } },
+            title: { display: true, text: 'Audio duration (s)', color: '#b0bdd0', font: { family: 'Inter', size: 11, weight: '600' } },
           },
         },
       },
@@ -1380,7 +1524,7 @@ export default function App() {
         datasets: [{
           data: [stageMean.preprocess, stageMean.encode, stageMean.decode, stageMean.tokenize],
           backgroundColor: ['#d9b37a', '#7ca6dc', '#79c29f', '#9aaad1'],
-          borderColor: '#172742',
+          borderColor: '#0e1117',
           borderWidth: 2,
         }],
       },
@@ -1389,7 +1533,7 @@ export default function App() {
         maintainAspectRatio: false,
         plugins: {
           legend: {
-            labels: { color: '#dce9fb', font: { family: 'IBM Plex Sans', size: 11 } },
+            labels: { color: '#b0bdd0', font: { family: 'Inter', size: 11 } },
           },
         },
       },
@@ -1413,7 +1557,7 @@ export default function App() {
           x: {
             ...chartBase('Mean ms').scales.x,
             stacked: true,
-            ticks: { color: '#c6d5ed', maxRotation: 30, minRotation: 30, font: { family: 'IBM Plex Mono', size: 9 } },
+            ticks: { color: '#6b7a90', maxRotation: 30, minRotation: 30, font: { family: 'JetBrains Mono', size: 9 } },
           },
           y: {
             ...chartBase('Mean ms').scales.y,
@@ -1466,6 +1610,109 @@ export default function App() {
 
   const compareA = useMemo(() => snapshots.find((s) => s.id === compareAId) || null, [snapshots, compareAId]);
   const compareB = useMemo(() => snapshots.find((s) => s.id === compareBId) || null, [snapshots, compareBId]);
+  const selectedParamDefs = useMemo(() => SNAPSHOT_PARAM_OPTIONS.filter((item) => selectedCompareParams.includes(item.key)), [selectedCompareParams]);
+  const selectedSnapshots = useMemo(() => {
+    if (!selectedSnapshotIds.length) return [];
+    const order = new Map(selectedSnapshotIds.map((id, idx) => [id, idx]));
+    return snapshots
+      .filter((snapshot) => order.has(snapshot.id))
+      .sort((a, b) => order.get(a.id) - order.get(b.id));
+  }, [snapshots, selectedSnapshotIds]);
+
+  const snapshotMultiCompareCharts = useMemo(() => {
+    if (!selectedSnapshots.length || !selectedParamDefs.length) return null;
+
+    const palette = [
+      'rgba(121, 194, 159, 0.95)',
+      'rgba(124, 166, 220, 0.95)',
+      'rgba(217, 179, 122, 0.95)',
+      'rgba(154, 170, 209, 0.95)',
+      'rgba(226, 151, 169, 0.95)',
+      'rgba(148, 218, 217, 0.95)',
+    ];
+
+    const summaryDatasets = [];
+    const byRepeatCharts = [];
+    const labelsBySnapshot = selectedSnapshots.map((snapshot) => snapshot.label);
+
+    selectedParamDefs.forEach((paramDef) => {
+      const repeatSet = new Set();
+      const runData = selectedSnapshots.map((snapshot) => {
+        const goodRuns = (snapshot.runs || []).filter((run) => (
+          !run?.error
+          && Number.isFinite(run?.repeatIndex)
+          && Number.isFinite(run?.metrics?.[paramDef.runField])
+        ));
+        goodRuns.forEach((run) => repeatSet.add(run.repeatIndex));
+        return {
+          snapshot,
+          goodRuns,
+          metricVals: goodRuns.map((run) => run.metrics[paramDef.runField]).filter(Number.isFinite),
+        };
+      });
+
+      summaryDatasets.push({
+        label: `${paramDef.label} mean (ms)`,
+        data: runData.map((entry) => mean(entry.metricVals)),
+        backgroundColor: paramDef.color,
+      });
+
+      const repeatIds = Array.from(repeatSet).sort((a, b) => a - b);
+      if (!repeatIds.length) return;
+
+      byRepeatCharts.push({
+        key: paramDef.key,
+        title: `${paramDef.label} Mean by Repeat`,
+        config: {
+          type: 'line',
+          data: {
+            labels: repeatIds.map((id) => `Run ${id}`),
+            datasets: runData.map((entry, idx) => ({
+              label: entry.snapshot.label,
+              borderColor: palette[idx % palette.length],
+              backgroundColor: palette[idx % palette.length].replace('0.95', '0.2'),
+              tension: 0.3,
+              pointRadius: 3,
+              data: repeatIds.map((repeatId) => mean(
+                entry.goodRuns
+                  .filter((run) => run.repeatIndex === repeatId)
+                  .map((run) => run.metrics[paramDef.runField])
+                  .filter(Number.isFinite),
+              )),
+            })),
+          },
+          options: chartBase(`${paramDef.label} mean (ms)`),
+        },
+      });
+    });
+
+    if (!summaryDatasets.length && !byRepeatCharts.length) return null;
+
+    const summary = {
+      type: 'bar',
+      data: {
+        labels: labelsBySnapshot,
+        datasets: summaryDatasets,
+      },
+      options: {
+        ...chartBase('Milliseconds'),
+        scales: {
+          ...chartBase('Milliseconds').scales,
+          x: {
+            ...chartBase('Milliseconds').scales.x,
+            ticks: {
+              color: '#6b7a90',
+              maxRotation: 25,
+              minRotation: 25,
+              font: { family: 'JetBrains Mono', size: 9 },
+            },
+          },
+        },
+      },
+    };
+
+    return { summary, byRepeatCharts };
+  }, [selectedSnapshots, selectedParamDefs]);
 
   function defaultSnapshotLabel() {
     const now = new Date();
@@ -1516,6 +1763,24 @@ export default function App() {
     setSnapshots((prev) => prev.filter((item) => item.id !== id));
   }
 
+  function toggleSnapshotSelection(id) {
+    setSelectedSnapshotIds((prev) => (
+      prev.includes(id)
+        ? prev.filter((item) => item !== id)
+        : [...prev, id]
+    ));
+  }
+
+  function toggleCompareParam(key) {
+    setSelectedCompareParams((prev) => {
+      if (prev.includes(key)) {
+        if (prev.length === 1) return prev;
+        return prev.filter((item) => item !== key);
+      }
+      return [...prev, key];
+    });
+  }
+
   function exportJson() {
     if (!runs.length) return;
     const payload = {
@@ -1534,261 +1799,366 @@ export default function App() {
     saveText(`parakeet-benchmark-${Date.now()}.csv`, csv, 'text/csv;charset=utf-8');
   }
 
+  const progressPct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="sidebar-header">
-          <h1>Parakeet Benchmark Lab</h1>
+      {/* ═══ HEADER ═══ */}
+      <header className="header">
+        <div className="header-left">
+          <h1>Parakeet.js Benchmark</h1>
+          <div className="header-pills">
+            <span className="pill">
+              <span className={`pill-dot ${hardwareSummary.webgpuLabel === 'Yes' ? 'green' : 'red'}`} />
+              {hardwareSummary.gpuModelLabel !== '-' ? hardwareSummary.gpuModelLabel : 'No GPU'}
+            </span>
+            <span className="pill">
+              <span className={`pill-dot ${isModelReady ? 'green' : isLoadingModel ? 'orange' : 'muted'}`} />
+              {isModelReady ? 'Model ready' : isLoadingModel ? 'Loading...' : 'No model'}
+            </span>
+            <span className="pill">
+              <span className={`pill-dot ${isRunning ? 'orange' : okRuns.length > 0 ? 'green' : 'muted'}`} />
+              {isRunning ? `Running ${progress.current}/${progress.total}` : `${okRuns.length} runs`}
+            </span>
+          </div>
         </div>
-
-        <section className="sidebar-section">
-          <h2>Hardware</h2>
-          <button className="btn" onClick={refreshHardwareProfile} disabled={isLoadingHardware || isRunning}>
-            {isLoadingHardware ? 'Refreshing...' : 'Refresh hardware'}
+        <div className="header-actions">
+          <button className="theme-toggle" onClick={toggleTheme} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+            {theme === 'dark' ? '☀️' : '🌙'}
           </button>
-          <p className="status-text">{hardwareStatus}</p>
-          <div className="kv-grid">
-            <div className="kv-row"><span>CPU</span><strong>{hardwareSummary.cpuLabel}</strong></div>
-            <div className="kv-row"><span>System RAM</span><strong>{hardwareSummary.systemMemoryLabel}</strong></div>
-            <div className="kv-row"><span>WebGPU</span><strong>{hardwareSummary.webgpuLabel}</strong></div>
-            <div className="kv-row"><span>GPU</span><strong>{hardwareSummary.gpuLabel}</strong></div>
-            <div className="kv-row"><span>GPU model</span><strong>{hardwareSummary.gpuModelLabel}</strong></div>
-            <div className="kv-row"><span>GPU cores</span><strong>{hardwareSummary.gpuCoresLabel}</strong></div>
-            <div className="kv-row"><span>VRAM</span><strong>{hardwareSummary.vramLabel}</strong></div>
-          </div>
-          {hardwareProfile?.webgpu?.features?.length ? <p className="subtle">WebGPU features: {hardwareProfile.webgpu.features.slice(0, 8).join(', ')}{hardwareProfile.webgpu.features.length > 8 ? ' ...' : ''}</p> : null}
-        </section>
-
-        <section className="sidebar-section">
-          <label>Model<select value={modelKey} onChange={(e) => setModelKey(e.target.value)} disabled={isLoadingModel || isRunning}>{MODEL_OPTIONS.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label>
-          <label>Backend<select value={backend} onChange={(e) => setBackend(e.target.value)} disabled={isLoadingModel || isRunning}>{BACKENDS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-          <div className="row-2">
-            <label>Encoder<select value={encoderQuant} onChange={(e) => setEncoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{encoderQuantOptions.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-            <label>Decoder<select value={decoderQuant} onChange={(e) => setDecoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{decoderQuantOptions.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
-          </div>
-          <label>Preprocessor<select value={preprocessorBackend} onChange={(e) => setPreprocessorBackend(e.target.value)} disabled={isLoadingModel || isRunning}><option value="js">JS (meljs)</option><option value="onnx">ONNX (nemo128.onnx)</option></select></label>
-          <label>CPU threads<input type="number" min="1" max="64" value={cpuThreads} onChange={(e) => setCpuThreads(clamp(e.target.value, cpuThreads, 1, 64))} disabled={isLoadingModel || isRunning} /></label>
-          <label className="check"><input type="checkbox" checked={enableProfiling} onChange={(e) => setEnableProfiling(e.target.checked)} disabled={isLoadingModel || isRunning} />Enable profiling</label>
-          <button className="btn btn-primary" onClick={loadModel} disabled={isLoadingModel || isRunning || isModelReady}>{isLoadingModel ? 'Loading...' : isModelReady ? 'Model ready' : 'Load model'}</button>
-          <p className="status-text">{modelStatus}</p>
-          {modelProgress ? <p className="subtle">{modelProgress}</p> : null}
-          {resolvedModelInfo ? <p className="subtle">{resolvedModelInfo}</p> : null}
-        </section>
-
-        <section className="sidebar-section">
-          <h2>Dataset</h2>
-          <label>Dataset<input value={datasetId} onChange={(e) => setDatasetId(e.target.value)} disabled={isLoadingDataset || isRunning} /></label>
-          <button className="btn" onClick={() => refreshDatasetMeta(datasetId, datasetConfig, datasetSplit, true)} disabled={isLoadingDataset || isRunning}>{isLoadingDataset ? 'Refreshing...' : 'Refresh metadata'}</button>
-          <div className="row-2">
-            <label>Config<select value={datasetConfig} onChange={(e) => refreshDatasetMeta(datasetId, e.target.value, datasetSplit)} disabled={isLoadingDataset || isRunning}>{configs.map((c) => <option key={c} value={c}>{c}</option>)}</select></label>
-            <label>Split<select value={datasetSplit} onChange={(e) => setDatasetSplit(e.target.value)} disabled={isLoadingDataset || isRunning}>{splits.map((s) => <option key={s} value={s}>{s}</option>)}</select></label>
-          </div>
-          <div className="row-2">
-            <label>Offset<input type="number" min="0" value={offset} onChange={(e) => setOffset(clamp(e.target.value, offset, 0, 1_000_000))} disabled={isRunning} /></label>
-            <label>Samples<input type="number" min="1" max="100" value={sampleCount} onChange={(e) => setSampleCount(clamp(e.target.value, sampleCount, 1, 100))} disabled={isRunning} /></label>
-          </div>
-          <button className="btn" onClick={prepareSampleRows} disabled={isRunning || isLoadingDataset}>Preview sample set</button>
-          <p className="status-text">{datasetStatus}</p>
-          {features.length ? <p className="subtle">Features: {features.join(', ')}</p> : null}
-          {splitCounts?.[datasetSplit]?.num_examples ? <p className="subtle">Rows: {splitCounts[datasetSplit].num_examples}</p> : null}
-        </section>
-
-        <section className="sidebar-section">
-          <h2>Run Plan</h2>
-          <div className="row-2">
-            <label>Repeats<input type="number" min="1" max="100" value={repeatCount} onChange={(e) => setRepeatCount(clamp(e.target.value, repeatCount, 1, 100))} disabled={isRunning} /></label>
-            <label>Warmups<input type="number" min="0" max="10" value={warmups} onChange={(e) => setWarmups(clamp(e.target.value, warmups, 0, 10))} disabled={isRunning} /></label>
-          </div>
-          <label className="check"><input type="checkbox" checked={randomize} onChange={(e) => setRandomize(e.target.checked)} disabled={isRunning} />Random sample rows</label>
-          <label>Random seed<input value={randomSeed} onChange={(e) => setRandomSeed(e.target.value)} placeholder="e.g. 42 or exp-a" disabled={isRunning || !randomize} /></label>
-          <button className="btn btn-primary" onClick={runBenchmark} disabled={isRunning || isLoadingModel || !isModelReady}>{isRunning ? 'Running...' : 'Start benchmark'}</button>
-          <button className="btn btn-danger" onClick={stopRun} disabled={!isRunning}>Stop</button>
-          <div className="row-2">
-            <button className="btn" onClick={exportJson} disabled={!runs.length || isRunning}>Export JSON</button>
-            <button className="btn" onClick={exportCsv} disabled={!runs.length || isRunning}>Export CSV</button>
-          </div>
-          <button className="btn" onClick={() => setRuns([])} disabled={!runs.length || isRunning}>Clear runs</button>
-          <label>Snapshot name<input value={snapshotName} onChange={(e) => setSnapshotName(e.target.value)} placeholder="optional label" disabled={isRunning} /></label>
-          <button className="btn" onClick={saveCurrentSnapshot} disabled={!runs.length || isRunning}>Save snapshot</button>
-          <p className="status-text">{benchStatus}</p>
-          {progress.total > 0 ? <p className="subtle">{progress.stage} ({progress.current}/{progress.total})</p> : null}
-        </section>
-
-        <section className="sidebar-section">
-          <h2>Compare Stored</h2>
-          <label>A<select value={compareAId} onChange={(e) => setCompareAId(e.target.value)} disabled={!snapshots.length}>{snapshots.length ? snapshots.map((s) => <option key={s.id} value={s.id}>{s.label}</option>) : <option value="">No snapshots</option>}</select></label>
-          <label>B<select value={compareBId} onChange={(e) => setCompareBId(e.target.value)} disabled={!snapshots.length}>{snapshots.length ? snapshots.map((s) => <option key={s.id} value={s.id}>{s.label}</option>) : <option value="">No snapshots</option>}</select></label>
-          <p className="subtle">{snapshots.length} stored snapshot(s)</p>
-        </section>
-      </aside>
-
-      <main className="main">
-        <div className="topbar">
-          <h2>Repeated Transcription Analytics</h2>
-          <div className="meta-text">{okRuns.length} successful / {runs.length} total{runErrors ? `, ${runErrors} errors` : ''}</div>
         </div>
+      </header>
 
-        <div className="kpi-row">
-          <div className="kpi-card teal"><div className="kpi-label">Total</div><div className="kpi-value">{ms(metrics.total.mean)}</div><div className="kpi-sub">p90 {ms(metrics.total.p90)}</div></div>
-          <div className="kpi-card green"><div className="kpi-label">Preprocess</div><div className="kpi-value">{ms(metrics.preprocess.mean)}</div><div className="kpi-sub">share {pct(Number.isFinite(metrics.preprocess.mean) && Number.isFinite(metrics.total.mean) && metrics.total.mean > 0 ? metrics.preprocess.mean / metrics.total.mean : null)}</div></div>
-          <div className="kpi-card orange"><div className="kpi-label">Decode</div><div className="kpi-value">{ms(metrics.decode.mean)}</div><div className="kpi-sub">std {ms(metrics.decode.stddev)}</div></div>
-          <div className="kpi-card teal"><div className="kpi-label">Encode</div><div className="kpi-value">{ms(metrics.encode.mean)}</div><div className="kpi-sub">Tokenize {ms(metrics.tokenize.mean)}</div></div>
-          <div className="kpi-card orange"><div className="kpi-label">Exact Repeatability</div><div className="kpi-value">{pct(repeatability.exactRate)}</div><div className="kpi-sub">sim {pct(repeatability.similarityMean)}</div></div>
-          <div className="kpi-card purple"><div className="kpi-label">RTF Median</div><div className="kpi-value">{Number.isFinite(metrics.rtf.median) ? `${metrics.rtf.median.toFixed(2)}x` : '-'}</div><div className="kpi-sub">duration avg {Number.isFinite(mean(okRuns.map((r) => r.audioDurationSec).filter(Number.isFinite))) ? mean(okRuns.map((r) => r.audioDurationSec).filter(Number.isFinite)).toFixed(2) : '-'} s</div></div>
-          <div className="kpi-card teal"><div className="kpi-label">Encoder RTFx</div><div className="kpi-value">{rtfx(metrics.encodeRtfx.median)}</div><div className="kpi-sub">std {rtfx(metrics.encodeRtfx.stddev)}</div></div>
-          <div className="kpi-card green"><div className="kpi-label">Decoder RTFx</div><div className="kpi-value">{rtfx(metrics.decodeRtfx.median)}</div><div className="kpi-sub">std {rtfx(metrics.decodeRtfx.stddev)}</div></div>
-        </div>
+      {/* ═══ TABS ═══ */}
+      <nav className="tabs">
+        {[
+          { id: 'benchmark', label: '⚙ Benchmark' },
+          { id: 'overview', label: 'Overview' },
+          { id: 'charts', label: 'Charts', count: chartConfigs ? 7 : 0 },
+          { id: 'compare', label: 'Compare', count: snapshots.length },
+          { id: 'data', label: 'Data', count: runs.length },
+        ].map((t) => (
+          <button
+            key={t.id}
+            className={`tab ${activeTab === t.id ? 'active' : ''}`}
+            onClick={() => setActiveTab(t.id)}
+          >
+            {t.label}
+            {t.count > 0 ? <span className="tab-count">{t.count}</span> : null}
+          </button>
+        ))}
+      </nav>
 
-        <section className="table-panel">
-          <div className="table-header"><h3>Snapshot A/B Comparison</h3></div>
-          <div className="table-wrap">
-            {compareA && compareB ? (
-              <table>
-                <thead><tr><th>Metric</th><th>A ({compareA.label})</th><th>B ({compareB.label})</th><th>Delta B vs A</th></tr></thead>
-                <tbody>
-                  <tr><td>Model</td><td>{compareA.settings?.modelKey || '-'}</td><td>{compareB.settings?.modelKey || '-'}</td><td>-</td></tr>
-                  <tr><td>Backend</td><td>{compareA.settings?.backend || '-'}</td><td>{compareB.settings?.backend || '-'}</td><td>-</td></tr>
-                  <tr><td>CPU</td><td>{compareA.hardwareSummary?.cpuLabel || '-'}</td><td>{compareB.hardwareSummary?.cpuLabel || '-'}</td><td>-</td></tr>
-                  <tr><td>GPU</td><td>{compareA.hardwareSummary?.gpuLabel || '-'}</td><td>{compareB.hardwareSummary?.gpuLabel || '-'}</td><td>-</td></tr>
-                  <tr><td>GPU model</td><td>{compareA.hardwareSummary?.gpuModelLabel || '-'}</td><td>{compareB.hardwareSummary?.gpuModelLabel || '-'}</td><td>-</td></tr>
-                  <tr><td>GPU cores</td><td>{compareA.hardwareSummary?.gpuCoresLabel || '-'}</td><td>{compareB.hardwareSummary?.gpuCoresLabel || '-'}</td><td>-</td></tr>
-                  <tr><td>VRAM</td><td>{compareA.hardwareSummary?.vramLabel || '-'}</td><td>{compareB.hardwareSummary?.vramLabel || '-'}</td><td>-</td></tr>
-                  <tr><td>System RAM</td><td>{compareA.hardwareSummary?.systemMemoryLabel || '-'}</td><td>{compareB.hardwareSummary?.systemMemoryLabel || '-'}</td><td>-</td></tr>
-                  <tr><td>Preprocessor</td><td>{compareA.settings?.preprocessorBackend || '-'}</td><td>{compareB.settings?.preprocessorBackend || '-'}</td><td>-</td></tr>
-                  <tr><td>Random seed</td><td>{compareA.settings?.randomize ? (compareA.settings?.randomSeed ?? 'random') : 'off'}</td><td>{compareB.settings?.randomize ? (compareB.settings?.randomSeed ?? 'random') : 'off'}</td><td>-</td></tr>
-                  <tr><td>Total mean</td><td>{ms(compareA.summary?.totalMean)}</td><td>{ms(compareB.summary?.totalMean)}</td><td>{deltaPercent(compareA.summary?.totalMean, compareB.summary?.totalMean, true)}</td></tr>
-                  <tr><td>Preprocess mean</td><td>{ms(compareA.summary?.preprocessMean)}</td><td>{ms(compareB.summary?.preprocessMean)}</td><td>{deltaPercent(compareA.summary?.preprocessMean, compareB.summary?.preprocessMean, true)}</td></tr>
-                  <tr><td>Encode mean</td><td>{ms(compareA.summary?.encodeMean)}</td><td>{ms(compareB.summary?.encodeMean)}</td><td>{deltaPercent(compareA.summary?.encodeMean, compareB.summary?.encodeMean, true)}</td></tr>
-                  <tr><td>Decode mean</td><td>{ms(compareA.summary?.decodeMean)}</td><td>{ms(compareB.summary?.decodeMean)}</td><td>{deltaPercent(compareA.summary?.decodeMean, compareB.summary?.decodeMean, true)}</td></tr>
-                  <tr><td>RTF median</td><td>{Number.isFinite(compareA.summary?.rtfMedian) ? `${compareA.summary.rtfMedian.toFixed(2)}x` : '-'}</td><td>{Number.isFinite(compareB.summary?.rtfMedian) ? `${compareB.summary.rtfMedian.toFixed(2)}x` : '-'}</td><td>{deltaPercent(compareA.summary?.rtfMedian, compareB.summary?.rtfMedian, false)}</td></tr>
-                  <tr><td>Encoder RTFx median</td><td>{rtfx(compareA.summary?.encodeRtfxMedian)}</td><td>{rtfx(compareB.summary?.encodeRtfxMedian)}</td><td>{deltaPercent(compareA.summary?.encodeRtfxMedian, compareB.summary?.encodeRtfxMedian, false)}</td></tr>
-                  <tr><td>Decoder RTFx median</td><td>{rtfx(compareA.summary?.decodeRtfxMedian)}</td><td>{rtfx(compareB.summary?.decodeRtfxMedian)}</td><td>{deltaPercent(compareA.summary?.decodeRtfxMedian, compareB.summary?.decodeRtfxMedian, false)}</td></tr>
-                  <tr><td>Exact repeatability</td><td>{pct(compareA.summary?.exactRate)}</td><td>{pct(compareB.summary?.exactRate)}</td><td>{deltaPercent(compareA.summary?.exactRate, compareB.summary?.exactRate, false)}</td></tr>
-                  <tr><td>Similarity mean</td><td>{pct(compareA.summary?.similarityMean)}</td><td>{pct(compareB.summary?.similarityMean)}</td><td>{deltaPercent(compareA.summary?.similarityMean, compareB.summary?.similarityMean, false)}</td></tr>
-                  <tr><td>Runs</td><td>{compareA.summary?.runCount ?? '-'}</td><td>{compareB.summary?.runCount ?? '-'}</td><td>-</td></tr>
-                </tbody>
-              </table>
-            ) : <div className="empty-row">Save snapshots, then choose A/B in the sidebar.</div>}
+      {/* ═══ TAB CONTENT ═══ */}
+      <div className="tab-content">
+        {/* ── BENCHMARK TAB ── */}
+        {activeTab === 'benchmark' && (
+          <div className="fade-in">
+            <div className="config-panel">
+              {/* ── Model Card ── */}
+              <div className="config-card">
+                <h3>Model &amp; Runtime</h3>
+                <div className="form-gap">
+                  <label>Model<select value={modelKey} onChange={(e) => setModelKey(e.target.value)} disabled={isLoadingModel || isRunning}>{MODEL_OPTIONS.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label>
+                  <label>Backend<select value={backend} onChange={(e) => setBackend(e.target.value)} disabled={isLoadingModel || isRunning}>{BACKENDS.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+                  <div className="row-2">
+                    <label>Encoder<select value={encoderQuant} onChange={(e) => setEncoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{encoderQuantOptions.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+                    <label>Decoder<select value={decoderQuant} onChange={(e) => setDecoderQuant(e.target.value)} disabled={isLoadingModel || isRunning}>{decoderQuantOptions.map((v) => <option key={v} value={v}>{v}</option>)}</select></label>
+                  </div>
+                  <label>Preprocessor<select value={preprocessorBackend} onChange={(e) => setPreprocessorBackend(e.target.value)} disabled={isLoadingModel || isRunning}><option value="js">JS (meljs)</option><option value="onnx">ONNX (nemo128.onnx)</option></select></label>
+                  <div className="row-2">
+                    <label>CPU threads<input type="number" min="1" max="64" value={cpuThreads} onChange={(e) => setCpuThreads(clamp(e.target.value, cpuThreads, 1, 64))} disabled={isLoadingModel || isRunning} /></label>
+                    <label className="check"><input type="checkbox" checked={enableProfiling} onChange={(e) => setEnableProfiling(e.target.checked)} disabled={isLoadingModel || isRunning} />Profiling</label>
+                  </div>
+                  <button className="btn btn-primary" onClick={loadModel} disabled={isLoadingModel || isRunning || isModelReady}>{isLoadingModel ? 'Loading...' : isModelReady ? 'Model ready ✓' : 'Load model'}</button>
+                  <p className="status-text">{modelStatus}</p>
+                  {modelProgress ? <p className="subtle">{modelProgress}</p> : null}
+                  {resolvedModelInfo ? <p className="subtle">{resolvedModelInfo}</p> : null}
+                </div>
+              </div>
+
+              {/* ── Dataset Card ── */}
+              <div className="config-card">
+                <h3>Dataset</h3>
+                <div className="form-gap">
+                  <label>Source<input value={datasetId} onChange={(e) => setDatasetId(e.target.value)} disabled={isLoadingDataset || isRunning} placeholder="HuggingFace dataset ID" /></label>
+                  <div className="row-2">
+                    <label>Config<select value={datasetConfig} onChange={(e) => refreshDatasetMeta(datasetId, e.target.value, datasetSplit)} disabled={isLoadingDataset || isRunning}>{configs.map((c) => <option key={c} value={c}>{c}</option>)}</select></label>
+                    <label>Split<select value={datasetSplit} onChange={(e) => setDatasetSplit(e.target.value)} disabled={isLoadingDataset || isRunning}>{splits.map((s) => <option key={s} value={s}>{s}</option>)}</select></label>
+                  </div>
+                  <div className="row-2">
+                    <label>Offset<input type="number" min="0" value={offset} onChange={(e) => setOffset(clamp(e.target.value, offset, 0, 1_000_000))} disabled={isRunning} /></label>
+                    <label>Samples<input type="number" min="1" value={sampleCount} onChange={(e) => setSampleCount(clamp(e.target.value, sampleCount, 1, MAX_SAMPLE_COUNT))} disabled={isRunning} /></label>
+                  </div>
+                  <div className="btn-group">
+                    <button className="btn" onClick={() => refreshDatasetMeta(datasetId, datasetConfig, datasetSplit, true)} disabled={isLoadingDataset || isRunning}>{isLoadingDataset ? 'Refreshing...' : 'Refresh'}</button>
+                    <button className="btn" onClick={clearDatasetCache} disabled={isLoadingDataset || isRunning}>Clear cache</button>
+                    <button className="btn" onClick={prepareSampleRows} disabled={isRunning || isLoadingDataset}>Preview</button>
+                  </div>
+                  <p className="status-text">{datasetStatus}</p>
+                  {splitCounts?.[datasetSplit]?.num_examples ? <p className="subtle">Rows: {splitCounts[datasetSplit].num_examples}</p> : null}
+                </div>
+              </div>
+
+              {/* ── Run Plan Card ── */}
+              <div className="config-card">
+                <h3>Benchmark Run</h3>
+                <div className="form-gap">
+                  <div className="row-3">
+                    <label>Repeats<input type="number" min="1" max="100" value={repeatCount} onChange={(e) => setRepeatCount(clamp(e.target.value, repeatCount, 1, 100))} disabled={isRunning} /></label>
+                    <label>Warmups<input type="number" min="0" max="10" value={warmups} onChange={(e) => setWarmups(clamp(e.target.value, warmups, 0, 10))} disabled={isRunning} /></label>
+                    <label>Seed<input value={randomSeed} onChange={(e) => setRandomSeed(e.target.value)} placeholder="42" disabled={isRunning || !randomize} /></label>
+                  </div>
+                  <label className="check"><input type="checkbox" checked={randomize} onChange={(e) => setRandomize(e.target.checked)} disabled={isRunning} />Randomize samples</label>
+                  <div className="btn-group">
+                    <button className="btn btn-primary" style={{ flex: 1 }} onClick={runBenchmark} disabled={isRunning || isLoadingModel || !isModelReady}>{isRunning ? 'Running...' : 'Start benchmark'}</button>
+                    <button className="btn btn-danger" onClick={stopRun} disabled={!isRunning}>Stop</button>
+                  </div>
+                  <div className="btn-group">
+                    <button className="btn btn-sm" onClick={exportJson} disabled={!runs.length || isRunning}>JSON</button>
+                    <button className="btn btn-sm" onClick={exportCsv} disabled={!runs.length || isRunning}>CSV</button>
+                    <button className="btn btn-sm" onClick={() => setRuns([])} disabled={!runs.length || isRunning}>Clear</button>
+                  </div>
+                  <label>Snapshot label<input value={snapshotName} onChange={(e) => setSnapshotName(e.target.value)} placeholder="auto-generated if empty" disabled={isRunning} /></label>
+                  <button className="btn" onClick={saveCurrentSnapshot} disabled={!runs.length || isRunning}>Save snapshot</button>
+                  <p className="status-text">{benchStatus}</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Progress bar inside benchmark tab */}
+            {(isRunning || progress.total > 0) && (
+              <div className="progress-bar-wrap fade-in">
+                <div className="progress-bar-track">
+                  <div className="progress-bar-fill" style={{ width: `${progressPct}%` }} />
+                </div>
+                <div className="progress-info">
+                  <span>{progress.stage}</span>
+                  <span className="meta-mono">{progress.current}/{progress.total} ({progressPct}%)</span>
+                </div>
+              </div>
+            )}
+
+            {/* Hardware info in benchmark tab */}
+            <section className="table-panel" style={{ marginTop: 12 }}>
+              <div className="table-header">
+                <h3>Hardware Profile</h3>
+                <button className="btn btn-sm" onClick={refreshHardwareProfile} disabled={isLoadingHardware || isRunning}>{isLoadingHardware ? 'Refreshing...' : 'Refresh'}</button>
+              </div>
+              <div style={{ padding: '12px 14px' }}>
+                <div className="kv-grid">
+                  <div className="kv-row"><span>CPU</span><strong>{hardwareSummary.cpuLabel}</strong></div>
+                  <div className="kv-row"><span>GPU model</span><strong>{hardwareSummary.gpuModelLabel}</strong></div>
+                  <div className="kv-row"><span>GPU (raw)</span><strong>{hardwareSummary.gpuLabel}</strong></div>
+                  <div className="kv-row"><span>WebGPU</span><strong>{hardwareSummary.webgpuLabel}</strong></div>
+                  <div className="kv-row"><span>System RAM</span><strong>{hardwareSummary.systemMemoryLabel}</strong></div>
+                </div>
+                {hardwareProfile?.webgpu?.features?.length ? <p className="subtle" style={{ marginTop: 8 }}>WebGPU features: {hardwareProfile.webgpu.features.slice(0, 12).join(', ')}{hardwareProfile.webgpu.features.length > 12 ? ' ...' : ''}</p> : null}
+              </div>
+            </section>
+
+            {/* Prepared samples preview */}
+            <section className="table-panel" style={{ marginTop: 12 }}>
+              <div className="table-header">
+                <h3>Prepared Samples ({preparedSamples.length})</h3>
+                <button className="btn btn-sm" onClick={() => setShowPreparedSamples((v) => !v)}>{showPreparedSamples ? 'Collapse' : 'Expand'}</button>
+              </div>
+              {showPreparedSamples ? (
+                <div className="table-wrap">
+                  {preparedSamples.length ? (
+                    <table>
+                      <thead><tr><th>Sample</th><th>Speaker</th><th>Gender</th><th>Speed</th><th>Volume</th><th>Reference</th></tr></thead>
+                      <tbody>
+                        {preparedSamples.map((s) => (
+                          <tr key={`${s.rowIndex}-${s.audioUrl}`}><td>{datasetSplit}:{s.rowIndex}</td><td>{s.speaker || '-'}</td><td>{s.gender || '-'}</td><td>{Number.isFinite(s.speed) ? s.speed.toFixed(2) : '-'}</td><td>{Number.isFinite(s.volume) ? s.volume.toFixed(2) : '-'}</td><td className="text-cell">{s.referenceText || '-'}</td></tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : <div className="empty-row">No prepared samples yet. Click Preview above.</div>}
+                </div>
+              ) : <div className="empty-row">Click Expand to inspect sampled rows.</div>}
+            </section>
           </div>
-        </section>
-
-        {chartConfigs ? (
-          <div className="chart-grid">
-            <ChartCard title="Encoder vs Decoder" badge="scatter" config={chartConfigs.encDec} />
-            <ChartCard title="Run Order vs Stage RTFx" badge="scatter" config={chartConfigs.rtfxRunOrder} />
-            <ChartCard title="Audio Duration vs Stage RTFx" badge="scatter" config={chartConfigs.rtfxDuration} />
-            <ChartCard title="Audio Duration vs Preprocess" badge="scatter" config={chartConfigs.durPre} />
-            <ChartCard title="Repeat Trend" badge="mean" config={chartConfigs.trend} />
-            <ChartCard title="Stage Bottleneck Share" badge="doughnut" config={chartConfigs.bottleneck} />
-            <ChartCard title="Config Stage Compare" badge="stacked" config={chartConfigs.compareStages} />
-          </div>
-        ) : (
-          <div className="empty-state"><p>Run a benchmark batch to generate charts.</p></div>
         )}
 
-        <section className="table-panel">
-          <div className="table-header"><h3>Per-Sample Repeatability</h3></div>
-          <div className="table-wrap">
-            {sampleStats.length ? (
-              <table>
-                <thead><tr><th>Sample</th><th>Runs</th><th>Unique</th><th>Exact</th><th>Similarity</th><th>Preproc mean</th><th>Encode mean</th><th>Decode mean</th><th>Decode std</th><th>Enc RTFx</th><th>Enc RTFx std</th><th>Dec RTFx</th><th>Dec RTFx std</th><th>Total mean</th></tr></thead>
-                <tbody>
-                  {sampleStats.map((s) => (
-                    <tr key={s.sampleKey}><td>{s.sampleKey}</td><td>{s.runs}</td><td>{s.uniqueOutputs}</td><td>{pct(s.exactRate)}</td><td>{pct(s.similarity)}</td><td>{ms(s.preprocessMean)}</td><td>{ms(s.encodeMean)}</td><td>{ms(s.decodeMean)}</td><td>{ms(s.decodeStd)}</td><td>{rtfx(s.encodeRtfxMean)}</td><td>{rtfx(s.encodeRtfxStd)}</td><td>{rtfx(s.decodeRtfxMean)}</td><td>{rtfx(s.decodeRtfxStd)}</td><td>{ms(s.totalMean)}</td></tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : <div className="empty-row">No sample stats yet.</div>}
-          </div>
-        </section>
-
-        <section className="table-panel">
-          <div className="table-header"><h3>Config Bottleneck Comparison</h3></div>
-          <div className="table-wrap">
-            {configStats.length ? (
-              <table>
-                <thead><tr><th>Config</th><th>Runs</th><th>Preproc mean</th><th>Encode mean</th><th>Decode mean</th><th>Tokenize mean</th><th>Total mean</th><th>Preproc share</th><th>Decode share</th></tr></thead>
-                <tbody>
-                  {configStats.map((c) => (
-                    <tr key={c.key}><td>{c.key}</td><td>{c.runs}</td><td>{ms(c.preprocessMean)}</td><td>{ms(c.encodeMean)}</td><td>{ms(c.decodeMean)}</td><td>{ms(c.tokenizeMean)}</td><td>{ms(c.totalMean)}</td><td>{pct(c.preprocessShare)}</td><td>{pct(c.decodeShare)}</td></tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : <div className="empty-row">Run at least one benchmark batch.</div>}
-          </div>
-        </section>
-
-        <section className="table-panel">
-          <div className="table-header"><h3>Stored Snapshots</h3></div>
-          <div className="table-wrap">
-            {snapshots.length ? (
-              <table>
-                <thead><tr><th>Label</th><th>Created</th><th>Model</th><th>Backend</th><th>CPU</th><th>GPU model</th><th>VRAM</th><th>Quant</th><th>Preproc</th><th>Seed</th><th>Total mean</th><th>Runs</th><th>Action</th></tr></thead>
-                <tbody>
-                  {snapshots.map((s) => (
-                    <tr key={s.id}>
-                      <td>{s.label}</td>
-                      <td>{s.createdAt ? new Date(s.createdAt).toLocaleString() : '-'}</td>
-                      <td>{s.settings?.modelKey || '-'}</td>
-                      <td>{s.settings?.backend || '-'}</td>
-                      <td>{s.hardwareSummary?.cpuLabel || '-'}</td>
-                      <td>{s.hardwareSummary?.gpuModelLabel || s.hardwareSummary?.gpuLabel || '-'}</td>
-                      <td>{s.hardwareSummary?.vramLabel || '-'}</td>
-                      <td>{`e:${s.settings?.encoderQuant || '-'} d:${s.settings?.decoderQuant || '-'}`}</td>
-                      <td>{s.settings?.preprocessorBackend || '-'}</td>
-                      <td>{s.settings?.randomize ? (s.settings?.randomSeed ?? 'random') : 'off'}</td>
-                      <td>{ms(s.summary?.totalMean)}</td>
-                      <td>{s.summary?.runCount ?? '-'}</td>
-                      <td><button className="btn" onClick={() => deleteSnapshot(s.id)}>Delete</button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : <div className="empty-row">No snapshots saved yet.</div>}
-          </div>
-        </section>
-
-        <section className="table-panel">
-          <div className="table-header"><h3>Recent Runs ({recentRuns.length})</h3></div>
-          <div className="table-wrap">
-            {recentRuns.length ? (
-              <table>
-                <thead><tr><th>Run</th><th>Sample</th><th>Repeat</th><th>Duration</th><th>Preproc</th><th>Encode</th><th>Decode</th><th>Tokenize</th><th>Total</th><th>RTF</th><th>Enc RTFx</th><th>Dec RTFx</th><th>Exact</th><th>Sim</th><th>Error</th></tr></thead>
-                <tbody>
-                  {recentRuns.map((r) => (
-                    <tr key={r.id} className={r.error ? 'row-error' : ''}><td>{r.id}</td><td>{r.sampleKey}</td><td>{r.repeatIndex}</td><td>{Number.isFinite(r.audioDurationSec) ? `${r.audioDurationSec.toFixed(2)} s` : '-'}</td><td>{ms(r.metrics?.preprocess_ms)}</td><td>{ms(r.metrics?.encode_ms)}</td><td>{ms(r.metrics?.decode_ms)}</td><td>{ms(r.metrics?.tokenize_ms)}</td><td>{ms(r.metrics?.total_ms)}</td><td>{Number.isFinite(r.metrics?.rtf) ? `${r.metrics.rtf.toFixed(2)}x` : '-'}</td><td>{rtfx(calcRtfx(r.audioDurationSec, r.metrics?.encode_ms))}</td><td>{rtfx(calcRtfx(r.audioDurationSec, r.metrics?.decode_ms))}</td><td>{typeof r.exactMatchToFirst === 'boolean' ? (r.exactMatchToFirst ? 'yes' : 'no') : '-'}</td><td>{Number.isFinite(r.similarityToFirst) ? `${(r.similarityToFirst * 100).toFixed(1)}%` : '-'}</td><td className="text-cell">{r.error || '-'}</td></tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : <div className="empty-row">No runs yet.</div>}
-          </div>
-        </section>
-
-        <section className="table-panel">
-          <div className="table-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
-            <h3>Prepared Samples ({preparedSamples.length})</h3>
-            <button className="btn" onClick={() => setShowPreparedSamples((v) => !v)}>
-              {showPreparedSamples ? 'Fold' : 'Unfold'}
-            </button>
-          </div>
-          {showPreparedSamples ? (
-            <div className="table-wrap">
-              {preparedSamples.length ? (
-                <table>
-                  <thead><tr><th>Sample</th><th>Speaker</th><th>Gender</th><th>Speed</th><th>Volume</th><th>Reference</th></tr></thead>
-                  <tbody>
-                    {preparedSamples.map((s) => (
-                      <tr key={`${s.rowIndex}-${s.audioUrl}`}><td>{datasetSplit}:{s.rowIndex}</td><td>{s.speaker || '-'}</td><td>{s.gender || '-'}</td><td>{Number.isFinite(s.speed) ? s.speed.toFixed(2) : '-'}</td><td>{Number.isFinite(s.volume) ? s.volume.toFixed(2) : '-'}</td><td className="text-cell">{s.referenceText || '-'}</td></tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : <div className="empty-row">No prepared samples yet.</div>}
+        {/* ── OVERVIEW TAB ── */}
+        {activeTab === 'overview' && (
+          <div className="fade-in">
+            <div className="kpi-row">
+              <div className="kpi-card teal"><div className="kpi-label">Total</div><div className="kpi-value">{ms(metrics.total.mean)}</div><div className="kpi-sub">p90 {ms(metrics.total.p90)}</div></div>
+              <div className="kpi-card green"><div className="kpi-label">Preprocess</div><div className="kpi-value">{ms(metrics.preprocess.mean)}</div><div className="kpi-sub">share {pct(Number.isFinite(metrics.preprocess.mean) && Number.isFinite(metrics.total.mean) && metrics.total.mean > 0 ? metrics.preprocess.mean / metrics.total.mean : null)}</div></div>
+              <div className="kpi-card orange"><div className="kpi-label">Decode</div><div className="kpi-value">{ms(metrics.decode.mean)}</div><div className="kpi-sub">std {ms(metrics.decode.stddev)}</div></div>
+              <div className="kpi-card teal"><div className="kpi-label">Encode</div><div className="kpi-value">{ms(metrics.encode.mean)}</div><div className="kpi-sub">Tokenize {ms(metrics.tokenize.mean)}</div></div>
+              <div className="kpi-card orange"><div className="kpi-label">Repeatability</div><div className="kpi-value">{pct(repeatability.exactRate)}</div><div className="kpi-sub">sim {pct(repeatability.similarityMean)}</div></div>
+              <div className="kpi-card purple"><div className="kpi-label">RTF Median</div><div className="kpi-value">{Number.isFinite(metrics.rtf.median) ? `${metrics.rtf.median.toFixed(2)}×` : '-'}</div><div className="kpi-sub">avg dur {Number.isFinite(mean(okRuns.map((r) => r.audioDurationSec).filter(Number.isFinite))) ? mean(okRuns.map((r) => r.audioDurationSec).filter(Number.isFinite)).toFixed(2) : '-'} s</div></div>
+              <div className="kpi-card teal"><div className="kpi-label">Encoder RTFx</div><div className="kpi-value">{rtfx(metrics.encodeRtfx.median)}</div><div className="kpi-sub">std {rtfx(metrics.encodeRtfx.stddev)}</div></div>
+              <div className="kpi-card green"><div className="kpi-label">Decoder RTFx</div><div className="kpi-value">{rtfx(metrics.decodeRtfx.median)}</div><div className="kpi-sub">std {rtfx(metrics.decodeRtfx.stddev)}</div></div>
             </div>
-          ) : (
-            <div className="empty-row">Folded. Unfold to inspect sampled rows.</div>
-          )}
-        </section>
-      </main>
+
+            <section className="table-panel">
+              <div className="table-header"><h3>Config Bottleneck</h3></div>
+              <div className="table-wrap">
+                {configStats.length ? (
+                  <table>
+                    <thead><tr><th>Config</th><th>Runs</th><th>Preproc</th><th>Encode</th><th>Decode</th><th>Total</th><th>Preproc %</th><th>Decode %</th></tr></thead>
+                    <tbody>
+                      {configStats.map((c) => (
+                        <tr key={c.key}><td>{c.key}</td><td>{c.runs}</td><td>{ms(c.preprocessMean)}</td><td>{ms(c.encodeMean)}</td><td>{ms(c.decodeMean)}</td><td>{ms(c.totalMean)}</td><td>{pct(c.preprocessShare)}</td><td>{pct(c.decodeShare)}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : <div className="empty-row">Run at least one benchmark batch.</div>}
+              </div>
+            </section>
+
+            <section className="table-panel">
+              <div className="table-header"><h3>Per-Sample Repeatability</h3></div>
+              <div className="table-wrap">
+                {sampleStats.length ? (
+                  <table>
+                    <thead><tr><th>Sample</th><th>Runs</th><th>Unique</th><th>Exact</th><th>Sim</th><th>Preproc</th><th>Encode</th><th>Decode</th><th>Decode σ</th><th>Enc RTFx</th><th>Dec RTFx</th><th>Total</th></tr></thead>
+                    <tbody>
+                      {sampleStats.map((s) => (
+                        <tr key={s.sampleKey}><td>{s.sampleKey}</td><td>{s.runs}</td><td>{s.uniqueOutputs}</td><td>{pct(s.exactRate)}</td><td>{pct(s.similarity)}</td><td>{ms(s.preprocessMean)}</td><td>{ms(s.encodeMean)}</td><td>{ms(s.decodeMean)}</td><td>{ms(s.decodeStd)}</td><td>{rtfx(s.encodeRtfxMean)}</td><td>{rtfx(s.decodeRtfxMean)}</td><td>{ms(s.totalMean)}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : <div className="empty-row">No sample stats yet.</div>}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* ── CHARTS TAB ── */}
+        {activeTab === 'charts' && (
+          <div className="fade-in">
+            {chartConfigs ? (
+              <div className="chart-grid">
+                <ChartCard title="Encoder vs Decoder" badge="scatter" config={chartConfigs.encDec} />
+                <ChartCard title="Run Order vs RTFx" badge="scatter" config={chartConfigs.rtfxRunOrder} />
+                <ChartCard title="Duration vs RTFx" badge="scatter" config={chartConfigs.rtfxDuration} />
+                <ChartCard title="Duration vs Preprocess" badge="scatter" config={chartConfigs.durPre} />
+                <ChartCard title="Repeat Trend" badge="line" config={chartConfigs.trend} />
+                <ChartCard title="Stage Bottleneck" badge="doughnut" config={chartConfigs.bottleneck} />
+                <ChartCard title="Config Compare" badge="stacked" config={chartConfigs.compareStages} />
+              </div>
+            ) : (
+              <div className="empty-state"><p>Run a benchmark batch to generate charts.</p></div>
+            )}
+          </div>
+        )}
+
+        {/* ── COMPARE TAB ── */}
+        {activeTab === 'compare' && (
+          <div className="fade-in">
+            <h3 className="section-title">A/B Snapshot Comparison</h3>
+            <div className="compare-selectors">
+              <label>Snapshot A<select value={compareAId} onChange={(e) => setCompareAId(e.target.value)} disabled={!snapshots.length}>{snapshots.length ? snapshots.map((s) => <option key={s.id} value={s.id}>{s.label}</option>) : <option value="">No snapshots</option>}</select></label>
+              <label>Snapshot B<select value={compareBId} onChange={(e) => setCompareBId(e.target.value)} disabled={!snapshots.length}>{snapshots.length ? snapshots.map((s) => <option key={s.id} value={s.id}>{s.label}</option>) : <option value="">No snapshots</option>}</select></label>
+            </div>
+
+            <section className="table-panel">
+              <div className="table-wrap">
+                {compareA && compareB ? (
+                  <table>
+                    <thead><tr><th>Metric</th><th>A</th><th>B</th><th>Δ B vs A</th></tr></thead>
+                    <tbody>
+                      <tr><td>Model</td><td>{compareA.settings?.modelKey || '-'}</td><td>{compareB.settings?.modelKey || '-'}</td><td>-</td></tr>
+                      <tr><td>Backend</td><td>{compareA.settings?.backend || '-'}</td><td>{compareB.settings?.backend || '-'}</td><td>-</td></tr>
+                      <tr><td>Quant</td><td>e:{compareA.settings?.encoderQuant || '-'} d:{compareA.settings?.decoderQuant || '-'}</td><td>e:{compareB.settings?.encoderQuant || '-'} d:{compareB.settings?.decoderQuant || '-'}</td><td>-</td></tr>
+                      <tr><td>Preprocessor</td><td>{compareA.settings?.preprocessorBackend || '-'}</td><td>{compareB.settings?.preprocessorBackend || '-'}</td><td>-</td></tr>
+                      <tr><td>CPU</td><td>{compareA.hardwareSummary?.cpuLabel || '-'}</td><td>{compareB.hardwareSummary?.cpuLabel || '-'}</td><td>-</td></tr>
+                      <tr><td>GPU</td><td>{compareA.hardwareSummary?.gpuModelLabel || '-'}</td><td>{compareB.hardwareSummary?.gpuModelLabel || '-'}</td><td>-</td></tr>
+                      <tr><td>Seed</td><td>{compareA.settings?.randomize ? (compareA.settings?.randomSeed ?? 'random') : 'off'}</td><td>{compareB.settings?.randomize ? (compareB.settings?.randomSeed ?? 'random') : 'off'}</td><td>-</td></tr>
+                      <tr className={`row-selectable ${selectedCompareParams.includes('total') ? 'row-selected' : ''}`} onClick={() => toggleCompareParam('total')}><td>Total mean</td><td>{ms(compareA.summary?.totalMean)}</td><td>{ms(compareB.summary?.totalMean)}</td><td>{deltaPercent(compareA.summary?.totalMean, compareB.summary?.totalMean, true)}</td></tr>
+                      <tr className={`row-selectable ${selectedCompareParams.includes('preprocess') ? 'row-selected' : ''}`} onClick={() => toggleCompareParam('preprocess')}><td>Preprocess mean</td><td>{ms(compareA.summary?.preprocessMean)}</td><td>{ms(compareB.summary?.preprocessMean)}</td><td>{deltaPercent(compareA.summary?.preprocessMean, compareB.summary?.preprocessMean, true)}</td></tr>
+                      <tr className={`row-selectable ${selectedCompareParams.includes('encode') ? 'row-selected' : ''}`} onClick={() => toggleCompareParam('encode')}><td>Encode mean</td><td>{ms(compareA.summary?.encodeMean)}</td><td>{ms(compareB.summary?.encodeMean)}</td><td>{deltaPercent(compareA.summary?.encodeMean, compareB.summary?.encodeMean, true)}</td></tr>
+                      <tr className={`row-selectable ${selectedCompareParams.includes('decode') ? 'row-selected' : ''}`} onClick={() => toggleCompareParam('decode')}><td>Decode mean</td><td>{ms(compareA.summary?.decodeMean)}</td><td>{ms(compareB.summary?.decodeMean)}</td><td>{deltaPercent(compareA.summary?.decodeMean, compareB.summary?.decodeMean, true)}</td></tr>
+                      <tr><td>RTF median</td><td>{Number.isFinite(compareA.summary?.rtfMedian) ? `${compareA.summary.rtfMedian.toFixed(2)}×` : '-'}</td><td>{Number.isFinite(compareB.summary?.rtfMedian) ? `${compareB.summary.rtfMedian.toFixed(2)}×` : '-'}</td><td>{deltaPercent(compareA.summary?.rtfMedian, compareB.summary?.rtfMedian, false)}</td></tr>
+                      <tr><td>Encoder RTFx</td><td>{rtfx(compareA.summary?.encodeRtfxMedian)}</td><td>{rtfx(compareB.summary?.encodeRtfxMedian)}</td><td>{deltaPercent(compareA.summary?.encodeRtfxMedian, compareB.summary?.encodeRtfxMedian, false)}</td></tr>
+                      <tr><td>Decoder RTFx</td><td>{rtfx(compareA.summary?.decodeRtfxMedian)}</td><td>{rtfx(compareB.summary?.decodeRtfxMedian)}</td><td>{deltaPercent(compareA.summary?.decodeRtfxMedian, compareB.summary?.decodeRtfxMedian, false)}</td></tr>
+                      <tr><td>Exact repeat</td><td>{pct(compareA.summary?.exactRate)}</td><td>{pct(compareB.summary?.exactRate)}</td><td>{deltaPercent(compareA.summary?.exactRate, compareB.summary?.exactRate, false)}</td></tr>
+                      <tr><td>Similarity</td><td>{pct(compareA.summary?.similarityMean)}</td><td>{pct(compareB.summary?.similarityMean)}</td><td>{deltaPercent(compareA.summary?.similarityMean, compareB.summary?.similarityMean, false)}</td></tr>
+                      <tr><td>Runs</td><td>{compareA.summary?.runCount ?? '-'}</td><td>{compareB.summary?.runCount ?? '-'}</td><td>-</td></tr>
+                    </tbody>
+                  </table>
+                ) : <div className="empty-row">Save snapshots, then select A and B above to compare.</div>}
+              </div>
+            </section>
+
+            <h3 className="section-title" style={{ marginTop: 24 }}>Multi-Snapshot Comparison</h3>
+            <div className="param-chips">
+              {SNAPSHOT_PARAM_OPTIONS.map((opt) => (
+                <button key={opt.key} className={`param-chip ${selectedCompareParams.includes(opt.key) ? 'active' : ''}`} onClick={() => toggleCompareParam(opt.key)}>{opt.label}</button>
+              ))}
+            </div>
+            {snapshotMultiCompareCharts ? (
+              <div className="chart-grid">
+                <ChartCard title="Parameter Means" badge="bar" config={snapshotMultiCompareCharts.summary} />
+                {snapshotMultiCompareCharts.byRepeatCharts.map((item) => (
+                  <ChartCard key={item.key} title={item.title} badge="line" config={item.config} />
+                ))}
+              </div>
+            ) : <div className="empty-state"><p>Select snapshots from the table below, then click parameter chips above to compare.</p></div>}
+
+            <section className="table-panel" style={{ marginTop: 16 }}>
+              <div className="table-header"><h3>Stored Snapshots ({snapshots.length})</h3></div>
+              <div className="table-wrap">
+                {snapshots.length ? (
+                  <table>
+                    <thead><tr><th>✓</th><th>Label</th><th>Model</th><th>Backend</th><th>Quant</th><th>Preproc</th><th>GPU</th><th>Seed</th><th>Total</th><th>Runs</th><th></th></tr></thead>
+                    <tbody>
+                      {snapshots.map((s) => (
+                        <tr
+                          key={s.id}
+                          className={`row-selectable ${selectedSnapshotIds.includes(s.id) ? 'row-selected' : ''}`}
+                          onClick={() => toggleSnapshotSelection(s.id)}
+                        >
+                          <td>{selectedSnapshotIds.includes(s.id) ? '●' : '○'}</td>
+                          <td>{s.label}</td>
+                          <td>{s.settings?.modelKey || '-'}</td>
+                          <td>{s.settings?.backend || '-'}</td>
+                          <td>{`e:${s.settings?.encoderQuant || '-'} d:${s.settings?.decoderQuant || '-'}`}</td>
+                          <td>{s.settings?.preprocessorBackend || '-'}</td>
+                          <td>{s.hardwareSummary?.gpuModelLabel || s.hardwareSummary?.gpuLabel || '-'}</td>
+                          <td>{s.settings?.randomize ? (s.settings?.randomSeed ?? 'rnd') : 'off'}</td>
+                          <td>{ms(s.summary?.totalMean)}</td>
+                          <td>{s.summary?.runCount ?? '-'}</td>
+                          <td><button className="btn btn-sm btn-danger" onClick={(e) => { e.stopPropagation(); deleteSnapshot(s.id); }}>×</button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : <div className="empty-row">No snapshots yet. Run a benchmark and save a snapshot.</div>}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* ── DATA TAB ── */}
+        {activeTab === 'data' && (
+          <div className="fade-in">
+            <section className="table-panel">
+              <div className="table-header">
+                <h3>Recent Runs ({recentRuns.length})</h3>
+                <span className="meta-mono">{okRuns.length} ok / {runErrors} errors</span>
+              </div>
+              <div className="table-wrap">
+                {recentRuns.length ? (
+                  <table>
+                    <thead><tr><th>#</th><th>Sample</th><th>Rep</th><th>Dur</th><th>Preproc</th><th>Encode</th><th>Decode</th><th>Token</th><th>Total</th><th>RTF</th><th>Enc RTFx</th><th>Dec RTFx</th><th>Exact</th><th>Sim</th><th>Error</th></tr></thead>
+                    <tbody>
+                      {recentRuns.map((r) => (
+                        <tr key={r.id} className={r.error ? 'row-error' : ''}><td>{r.id}</td><td>{r.sampleKey}</td><td>{r.repeatIndex}</td><td>{Number.isFinite(r.audioDurationSec) ? `${r.audioDurationSec.toFixed(2)}s` : '-'}</td><td>{ms(r.metrics?.preprocess_ms)}</td><td>{ms(r.metrics?.encode_ms)}</td><td>{ms(r.metrics?.decode_ms)}</td><td>{ms(r.metrics?.tokenize_ms)}</td><td>{ms(r.metrics?.total_ms)}</td><td>{Number.isFinite(r.metrics?.rtf) ? `${r.metrics.rtf.toFixed(1)}×` : '-'}</td><td>{rtfx(calcRtfx(r.audioDurationSec, r.metrics?.encode_ms))}</td><td>{rtfx(calcRtfx(r.audioDurationSec, r.metrics?.decode_ms))}</td><td>{typeof r.exactMatchToFirst === 'boolean' ? (r.exactMatchToFirst ? '✓' : '✗') : '-'}</td><td>{Number.isFinite(r.similarityToFirst) ? `${(r.similarityToFirst * 100).toFixed(1)}%` : '-'}</td><td className="text-cell">{r.error || '-'}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : <div className="empty-row">No runs yet.</div>}
+              </div>
+            </section>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
